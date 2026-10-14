@@ -9,6 +9,7 @@ export declare const REWIND_DEFAULTS: {
     pathFields: string;
     excludeGlobs: string;
     skipGenerated: boolean;
+    generatedDirectories: string;
     captureExternal: boolean;
     maxSnapshotFiles: number;
     maxFileBytes: number;
@@ -35,10 +36,11 @@ export declare const REWIND_DEFAULTS: {
  */
 export declare function resolveConfig(config?: RewindConfig): ResolvedRewindConfig;
 /** Settings-card fields. `storageDir` stays on the cordis config layer. */
-export declare function tunableSettings(config: ResolvedRewindConfig): Omit<ResolvedRewindConfig, 'storageDir' | 'shellTools' | 'extraFileTools' | 'pathFields' | 'excludeGlobs'> & {
+export declare function tunableSettings(config: ResolvedRewindConfig): Omit<ResolvedRewindConfig, 'storageDir' | 'shellTools' | 'extraFileTools' | 'pathFields' | 'excludeGlobs' | 'generatedDirectories'> & {
     shellTools: string;
     extraFileTools: string;
     pathFields: string;
     excludeGlobs: string;
+    generatedDirectories: string;
 };
 export type { ConflictPolicy, OriginCheck, PreviewTrust, ShellPolicy };

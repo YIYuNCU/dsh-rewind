@@ -23,6 +23,7 @@ export interface RewindSettings {
   pathFields: string
   excludeGlobs: string
   skipGenerated: boolean
+  generatedDirectories: string
   captureExternal: boolean
   maxSnapshotFiles: number
   maxFileBytes: number
@@ -60,6 +61,7 @@ export const RewindSettingsSchema: Schema<RewindSettings> = z.object({
   pathFields: volatileWhenSupported(z.string().default(REWIND_DEFAULTS.pathFields)),
   excludeGlobs: volatileWhenSupported(z.string().default(REWIND_DEFAULTS.excludeGlobs)),
   skipGenerated: volatileWhenSupported(z.boolean().default(REWIND_DEFAULTS.skipGenerated)),
+  generatedDirectories: volatileWhenSupported(z.string().default(REWIND_DEFAULTS.generatedDirectories)),
   captureExternal: volatileWhenSupported(z.boolean().default(REWIND_DEFAULTS.captureExternal)),
   maxSnapshotFiles: volatileWhenSupported(z.number().step(1).min(1).max(100_000).default(REWIND_DEFAULTS.maxSnapshotFiles)),
   maxFileBytes: volatileWhenSupported(z.number().step(1).min(1).default(REWIND_DEFAULTS.maxFileBytes)),

@@ -30,8 +30,14 @@ export interface RewindConfig {
     readonly pathFields?: string;
     /** Newline-separated globs. A match is recorded as neither a file nor a deletion. */
     readonly excludeGlobs?: string;
-    /** Also skip `node_modules`, `.git`, `dist`, `coverage`, and `.dsh`. */
+    /** Skip directories named in {@link RewindConfig.generatedDirectories}. */
     readonly skipGenerated?: boolean;
+    /**
+     * Comma-separated directory names skipped when {@link RewindConfig.skipGenerated} is on.
+     * A name matches one whole path segment, so `target` skips `target/debug` but not `targeting`.
+     * `*.suffix` matches a segment that ends with `.suffix`, such as `pkg.egg-info`.
+     */
+    readonly generatedDirectories?: string;
     /**
      * Snapshot eligible files at each turn start.
      * Rewinding that turn then undoes later manual edits and script edits.
@@ -81,6 +87,8 @@ export interface ResolvedRewindConfig {
     readonly pathFields: readonly string[];
     readonly excludeGlobs: readonly string[];
     readonly skipGenerated: boolean;
+    /** Directory names skipped as a whole path segment when {@link ResolvedRewindConfig.skipGenerated} is on. */
+    readonly generatedDirectories: readonly string[];
     readonly captureExternal: boolean;
     readonly maxSnapshotFiles: number;
     readonly maxFileBytes: number;

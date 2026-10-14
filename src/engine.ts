@@ -223,7 +223,7 @@ export class RewindEngine {
         await this.flush(open)
         return
       }
-      if ((config.skipGenerated && isGeneratedPath(resolved.relativePath)) || matchesGlob(resolved.relativePath, config.excludeGlobs)) {
+      if ((config.skipGenerated && isGeneratedPath(resolved.relativePath, config.generatedDirectories)) || matchesGlob(resolved.relativePath, config.excludeGlobs)) {
         open.inflight.delete(classified.path)
         return
       }

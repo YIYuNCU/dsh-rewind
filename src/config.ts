@@ -5,6 +5,30 @@ import type { ConflictPolicy, OriginCheck, PreviewTrust, ResolvedRewindConfig, R
 
 const DEFAULT_SHELL_TOOLS = ['bash', 'shell', 'run_code', 'terminal'] as const
 const DEFAULT_PATH_FIELDS = ['file_path', 'path'] as const
+/**
+ * Generated and temporary directory names for common languages and tools.
+ * A name matches one path segment. `*.suffix` matches a segment that ends with `.suffix`.
+ * Source names such as `src` and `lib` are omitted on purpose.
+ */
+const DEFAULT_GENERATED_DIRECTORIES = [
+  'node_modules', 'bower_components', 'dist', 'build', 'out', 'coverage', '.nyc_output', 'htmlcov',
+  '.next', '.nuxt', '.output', '.svelte-kit', '.astro', '.angular', '.turbo', '.parcel-cache',
+  '.cache', '.vite', '.docusaurus', '.vuepress', 'storybook-static', '.nx',
+  '.git', '.dsh', 'tmp', 'temp', 'Temp', '.tmp', '.temp', 'cache',
+  '__pycache__', '.venv', 'venv', '.tox', '.nox', '.mypy_cache', '.pytest_cache', '.ruff_cache',
+  '.hypothesis', '.pytype', '.pyre', '.eggs', 'site-packages', '.ipynb_checkpoints', '*.egg-info',
+  'target', '.gradle', 'bin', 'obj', 'Obj', 'TestResults', '.vs', 'ipch', 'Debug', 'Release',
+  'x64', 'x86', 'ARM', 'ARM64', 'CMakeFiles', 'cmake-build-debug', 'cmake-build-release',
+  'cmake-build-relwithdebinfo', 'cmake-build-minsizerel',
+  'vendor', '.bundle', '.yardoc', '_build', 'deps', '.elixir_ls', 'dist-newstyle', '.stack-work', '_opam',
+  '.build', 'DerivedData', '.swiftpm', 'Pods', 'xcuserdata', '.dart_tool', 'zig-out', 'zig-cache',
+  '.zig-cache', 'nimcache', 'blib', 'lua_modules', '.dub',
+  'bazel-bin', 'bazel-out', 'bazel-testlogs', 'bazel-genfiles', 'buck-out', '.terraform', '.terragrunt-cache', '.direnv',
+  '.externalNativeBuild', '.cxx',
+  'Library', 'Logs', 'MemoryCaptures', 'Binaries', 'DerivedDataCache', 'Intermediate', 'Saved',
+  '.godot', '.import', '_site', '.jekyll-cache', '.sass-cache', '.Rproj.user',
+  'test-results', 'playwright-report', 'blob-report',
+] as const
 
 /** Built-in defaults. Numeric settings are bytes, days, or milliseconds as named. */
 export const REWIND_DEFAULTS = {
@@ -16,6 +40,7 @@ export const REWIND_DEFAULTS = {
   pathFields: DEFAULT_PATH_FIELDS.join(','),
   excludeGlobs: '',
   skipGenerated: true,
+  generatedDirectories: DEFAULT_GENERATED_DIRECTORIES.join(','),
   captureExternal: true,
   maxSnapshotFiles: 2_000,
   maxFileBytes: 8 * 1024 * 1024,
@@ -52,6 +77,7 @@ export function resolveConfig(config: RewindConfig = {}): ResolvedRewindConfig {
     pathFields: csv(config.pathFields ?? REWIND_DEFAULTS.pathFields),
     excludeGlobs: splitList(config.excludeGlobs ?? REWIND_DEFAULTS.excludeGlobs, '\n'),
     skipGenerated: bool(config.skipGenerated, REWIND_DEFAULTS.skipGenerated, 'skipGenerated'),
+    generatedDirectories: directoryNames(config.generatedDirectories ?? REWIND_DEFAULTS.generatedDirectories),
     captureExternal: bool(config.captureExternal, REWIND_DEFAULTS.captureExternal, 'captureExternal'),
     maxSnapshotFiles: bounded(config.maxSnapshotFiles, REWIND_DEFAULTS.maxSnapshotFiles, 1, 100_000, 'maxSnapshotFiles'),
     maxFileBytes: positive(config.maxFileBytes, REWIND_DEFAULTS.maxFileBytes, 'maxFileBytes'),
@@ -77,11 +103,12 @@ export function resolveConfig(config: RewindConfig = {}): ResolvedRewindConfig {
 }
 
 /** Settings-card fields. `storageDir` stays on the cordis config layer. */
-export function tunableSettings(config: ResolvedRewindConfig): Omit<ResolvedRewindConfig, 'storageDir' | 'shellTools' | 'extraFileTools' | 'pathFields' | 'excludeGlobs'> & {
+export function tunableSettings(config: ResolvedRewindConfig): Omit<ResolvedRewindConfig, 'storageDir' | 'shellTools' | 'extraFileTools' | 'pathFields' | 'excludeGlobs' | 'generatedDirectories'> & {
   shellTools: string
   extraFileTools: string
   pathFields: string
   excludeGlobs: string
+  generatedDirectories: string
 } {
   return {
     enabled: config.enabled,
@@ -92,6 +119,7 @@ export function tunableSettings(config: ResolvedRewindConfig): Omit<ResolvedRewi
     pathFields: config.pathFields.join(','),
     excludeGlobs: config.excludeGlobs.join('\n'),
     skipGenerated: config.skipGenerated,
+    generatedDirectories: config.generatedDirectories.join(','),
     captureExternal: config.captureExternal,
     maxSnapshotFiles: config.maxSnapshotFiles,
     maxFileBytes: config.maxFileBytes,
@@ -157,6 +185,23 @@ function bounded(value: number | undefined, fallback: number, min: number, max: 
 
 function csv(value: string): readonly string[] {
   return splitList(value, ',')
+}
+
+/** A directory name, or `*.suffix` for a segment that ends with that suffix. */
+function directoryNames(value: string): readonly string[] {
+  const names = csv(value)
+  for (const name of names) {
+    if (!validDirectoryName(name)) {
+      throw new RewindError('INVALID_CONFIG', 'generatedDirectories entries must be one directory name, or *.suffix')
+    }
+  }
+  return names
+}
+
+function validDirectoryName(name: string): boolean {
+  if (name === '.' || name === '..' || name.includes('/') || name.includes('\\')) return false
+  if (!name.includes('*')) return true
+  return name.startsWith('*.') && name.length > 2 && !name.includes('*', 1)
 }
 
 function splitList(value: string, separator: string): readonly string[] {

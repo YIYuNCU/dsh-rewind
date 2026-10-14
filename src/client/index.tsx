@@ -16,6 +16,7 @@ interface SettingsValue {
   pathFields: string
   excludeGlobs: string
   skipGenerated: boolean
+  generatedDirectories: string
   captureExternal: boolean
   maxFileBytes: number
   maxCheckpointsPerSession: number
@@ -108,11 +109,12 @@ const UNAVAILABLE: SettingsSnapshot = { status: 'unavailable' }
 const MIB = 1024 * 1024
 const VISIBLE_FIELDS: readonly {
   readonly key: keyof SettingsValue
-  readonly kind: 'bool' | 'number' | 'select' | 'mib'
+  readonly kind: 'bool' | 'number' | 'select' | 'mib' | 'text'
   readonly group: SettingsGroup
   readonly options?: readonly string[]
 }[] = [
   { key: 'skipGenerated', kind: 'bool', group: 'capture' },
+  { key: 'generatedDirectories', kind: 'text', group: 'capture' },
   { key: 'captureExternal', kind: 'bool', group: 'capture' },
   { key: 'captureSubagents', kind: 'bool', group: 'capture' },
   { key: 'shellPolicy', kind: 'select', group: 'capture', options: ['gap', 'ignore'] },
@@ -163,7 +165,8 @@ const copy = {
     fields: {
       captureSubagents: ['记录子代理', '子代理改的文件算到父会话当前这一轮。'],
       shellPolicy: ['命令工具', '只标明这一轮跑过命令，不会给命令做快照。'],
-      skipGenerated: ['跳过生成目录', '不记录 node_modules、.git、dist、coverage 和 .dsh。'],
+      skipGenerated: ['跳过生成目录', '打开后，不记录下面列出的目录，回退时也不会删它们。'],
+      generatedDirectories: ['生成目录', '目录名用逗号分开，按路径里的一整段匹配。默认已包含常见语言的生成目录、依赖目录、缓存和临时目录。*.egg-info 匹配以 .egg-info 结尾的目录。改这里会替换整份名单。'],
       captureExternal: ['记录回合之间的改动', '每轮开始时记下工作区。之后的手改和脚本改动，回退到这一轮时会撤掉。'],
       retentionDays: ['保留天数', '0 表示不按天数删除。'],
       maxStorageBytes: ['最大存储空间', '全部会话加在一起的上限。超出后丢掉最旧的一轮，至少保留一轮。'],
@@ -211,7 +214,8 @@ const copy = {
     fields: {
       captureSubagents: ['Capture subagents', 'Attribute a subagent edit to the parent session’s open turn.'],
       shellPolicy: ['Command tools', 'Only marks that a command ran. The command itself is not snapshotted.'],
-      skipGenerated: ['Skip generated directories', 'Do not record node_modules, .git, dist, coverage, or .dsh.'],
+      skipGenerated: ['Skip generated directories', 'When on, the directories below are not recorded and are not deleted on rewind.'],
+      generatedDirectories: ['Generated directories', 'Comma-separated names, matched as a whole path segment. The default already covers common languages’ build, dependency, cache, and temporary directories. *.egg-info matches a name ending in .egg-info. Editing this replaces the whole list.'],
       captureExternal: ['Record edits between turns', 'Snapshot the workspace when a turn starts. Later manual and script edits are undone when you rewind to that turn.'],
       retentionDays: ['Retention days', 'Zero disables the age sweep.'],
       maxStorageBytes: ['Maximum storage', 'Cap across every session. The oldest turn is dropped until it fits, and at least one turn is kept.'],
@@ -482,6 +486,16 @@ function RewindSettingsCard({ view, scope }: SettingsProps): ReactNode {
                       ))}
                     </select>
                   ) : null}
+                  {field.kind === 'text' ? (
+                    <textarea
+                      aria-label={labels?.[0] ?? field.key}
+                      spellCheck={false}
+                      rows={6}
+                      value={typeof current === 'string' ? current : ''}
+                      disabled={disabled}
+                      onChange={(event) => { write(field.key, event.target.value) }}
+                    />
+                  ) : null}
                   {field.kind === 'number' || field.kind === 'mib' ? (
                     <label>
                       <input
@@ -611,6 +625,8 @@ function mountStyles(): () => void {
     '[data-dsh-rewind="copy"] strong { font-size: 13px; font-weight: 500; line-height: 20px; }',
     '[data-dsh-rewind="copy"] span, [data-dsh-rewind="empty"], [data-dsh-rewind="path"] { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }',
     '[data-dsh-rewind="control"] select, [data-dsh-rewind="control"] input { height: 32px; min-width: 148px; padding: 0 10px; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 13px; }',
+    '[data-dsh-rewind="control"] textarea { width: 320px; min-height: 96px; padding: 6px 10px; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 12px; line-height: 18px; resize: vertical; }',
+    '[data-dsh-rewind="row"]:has(textarea) { align-items: flex-start; }',
     '[data-dsh-rewind="control"] label { display: flex; align-items: center; gap: 8px; }',
     '[data-dsh-rewind="unit"] { font-size: 12px; color: var(--dsw-alias-label-secondary); }',
     '[data-dsh-rewind="usage-head"] { display: flex; align-items: center; justify-content: space-between; gap: 12px; }',

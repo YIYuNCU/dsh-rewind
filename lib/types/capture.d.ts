@@ -29,11 +29,13 @@ export declare function classifyTool(name: string, args: unknown, config: Pick<R
 /** True when a relative slash path matches one configured glob. */
 export declare function matchesGlob(path: string, patterns: readonly string[]): boolean;
 /**
- * True when any path segment is a generated directory.
- * Matching is by segment, so `distribute` is not `dist`.
+ * True when any path segment is one of the configured directory names.
+ * Matching is by the whole segment, so `distribute` is not `dist` and `targeting` is not `target`.
+ * A name of the form `*.suffix` matches a segment that ends with `.suffix`.
  * @param path - Workspace-relative or absolute path.
+ * @param names - Directory names from `generatedDirectories`.
  */
-export declare function isGeneratedPath(path: string): boolean;
+export declare function isGeneratedPath(path: string, names: readonly string[]): boolean;
 /**
  * Read a regular file without following a final symlink.
  * @param workspace - Canonical workspace root.
@@ -70,7 +72,7 @@ export interface ListedFile {
  * @param config - Size and exclusion rules.
  * @param limit - Stop after this many files and mark the walk incomplete.
  */
-export declare function listEligibleFiles(workspace: string, config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs'>, limit?: number): Promise<{
+export declare function listEligibleFiles(workspace: string, config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'generatedDirectories' | 'excludeGlobs'>, limit?: number): Promise<{
     readonly files: readonly ListedFile[];
     readonly complete: boolean;
 }>;
@@ -81,7 +83,7 @@ export declare function listEligibleFiles(workspace: string, config: Pick<Resolv
  * @param config - Size, exclusion, and snapshot limits.
  * @returns Captured files and whether every eligible file fit in the cap.
  */
-export declare function scanWorkspace(workspace: string, config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs' | 'maxSnapshotFiles'>): Promise<WorkspaceScan>;
+export declare function scanWorkspace(workspace: string, config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'generatedDirectories' | 'excludeGlobs' | 'maxSnapshotFiles'>): Promise<WorkspaceScan>;
 /** Run `task` over `items` with a fixed number of workers. */
 export declare function runPool<T, R>(items: readonly T[], limit: number, task: (item: T) => Promise<R>): Promise<R[]>;
 /** Canonicalize a directory, or return it unchanged when it does not exist yet. */

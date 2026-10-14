@@ -39,20 +39,26 @@ export function classifyTool(name: string, args: unknown, config: Pick<ResolvedR
   return { kind: 'ignore' }
 }
 
-const GENERATED_DIRECTORIES = ['node_modules', '.git', 'dist', 'coverage', '.dsh'] as const
-
 /** True when a relative slash path matches one configured glob. */
 export function matchesGlob(path: string, patterns: readonly string[]): boolean {
   return patterns.some(pattern => globToRegExp(pattern).test(path))
 }
 
 /**
- * True when any path segment is a generated directory.
- * Matching is by segment, so `distribute` is not `dist`.
+ * True when any path segment is one of the configured directory names.
+ * Matching is by the whole segment, so `distribute` is not `dist` and `targeting` is not `target`.
+ * A name of the form `*.suffix` matches a segment that ends with `.suffix`.
  * @param path - Workspace-relative or absolute path.
+ * @param names - Directory names from `generatedDirectories`.
  */
-export function isGeneratedPath(path: string): boolean {
-  return path.split(/[/\\]/u).some(part => (GENERATED_DIRECTORIES as readonly string[]).includes(part))
+export function isGeneratedPath(path: string, names: readonly string[]): boolean {
+  return path.split(/[/\\]/u).some(part => names.some(name => segmentNameMatches(part, name)))
+}
+
+function segmentNameMatches(part: string, name: string): boolean {
+  if (!name.startsWith('*.')) return part === name
+  const suffix = name.slice(1)
+  return part.length > suffix.length && part.endsWith(suffix)
 }
 
 /**
@@ -132,7 +138,7 @@ export interface ListedFile {
  */
 export async function listEligibleFiles(
   workspace: string,
-  config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs'>,
+  config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'generatedDirectories' | 'excludeGlobs'>,
   limit?: number,
 ): Promise<{ readonly files: readonly ListedFile[]; readonly complete: boolean }> {
   const files: ListedFile[] = []
@@ -152,14 +158,14 @@ export async function listEligibleFiles(
       const absolute = join(directory, entry.name)
       if (entry.isSymbolicLink()) continue
       if (entry.isDirectory()) {
-        if (config.skipGenerated && isGeneratedPath(entry.name)) continue
+        if (config.skipGenerated && isGeneratedPath(entry.name, config.generatedDirectories)) continue
         await walk(absolute)
         continue
       }
       if (!entry.isFile()) continue
       const relativePath = relativePosix(workspace, absolute)
       if (relativePath === undefined) continue
-      if ((config.skipGenerated && isGeneratedPath(relativePath)) || matchesGlob(relativePath, config.excludeGlobs)) continue
+      if ((config.skipGenerated && isGeneratedPath(relativePath, config.generatedDirectories)) || matchesGlob(relativePath, config.excludeGlobs)) continue
       pending.push({ absolute, relativePath })
     }
     const stats = await runPool(pending, 16, async item => {
@@ -197,7 +203,7 @@ export async function listEligibleFiles(
  */
 export async function scanWorkspace(
   workspace: string,
-  config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs' | 'maxSnapshotFiles'>,
+  config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'generatedDirectories' | 'excludeGlobs' | 'maxSnapshotFiles'>,
 ): Promise<WorkspaceScan> {
   const listed = await listEligibleFiles(workspace, config, config.maxSnapshotFiles)
   let dropped = false

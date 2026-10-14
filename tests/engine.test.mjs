@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyTool, isGeneratedPath, matchesGlob } from '../lib/capture.js'
+import { resolveConfig } from '../lib/config.js'
 import { RewindEngine } from '../lib/engine.js'
 import { RewindError } from '../lib/errors.js'
 import { retainGlobal, retainTurns } from '../lib/ledger.js'
@@ -60,9 +61,24 @@ test('classifies built-in file tools, extra tools, and shells', () => {
   assert.deepEqual(classifyTool('save', { target: 'note.txt' }, config), { kind: 'file', path: 'note.txt' })
   assert.equal(matchesGlob('secret/a.txt', ['secret/**']), true)
   assert.equal(matchesGlob('notes/a.txt', ['secret/**']), false)
-  assert.equal(isGeneratedPath('node_modules/pkg/index.js'), true)
-  assert.equal(isGeneratedPath('src/.git/config'), true)
-  assert.equal(isGeneratedPath('src/distribute/app.js'), false)
+  const names = ['node_modules', '.git', 'dist', 'coverage', '.dsh']
+  assert.equal(isGeneratedPath('node_modules/pkg/index.js', names), true)
+  assert.equal(isGeneratedPath('src/.git/config', names), true)
+  assert.equal(isGeneratedPath('src/distribute/app.js', names), false)
+  assert.equal(isGeneratedPath('target/debug/app', ['target', '__pycache__']), true)
+  assert.equal(isGeneratedPath('src/targeting/app.js', ['target']), false)
+  assert.equal(isGeneratedPath('pkg/__pycache__/a.pyc', ['__pycache__']), true)
+  assert.equal(isGeneratedPath('pkg/demo.egg-info/PKG-INFO', ['*.egg-info']), true)
+  assert.equal(isGeneratedPath('pkg/egg-info/PKG-INFO', ['*.egg-info']), false)
+  const defaults = resolveConfig().generatedDirectories
+  for (const name of ['node_modules', '__pycache__', '.venv', 'target', '.gradle', 'bin', 'obj', 'vendor', '_build', 'deps', '.dart_tool', 'CMakeFiles', 'bazel-out', '.terraform', 'Library', '*.egg-info']) {
+    assert.equal(defaults.includes(name), true, name)
+  }
+  assert.equal(defaults.includes('src'), false)
+  assert.equal(defaults.includes('lib'), false)
+  assert.equal(new Set(defaults).size, defaults.length)
+  assert.throws(() => resolveConfig({ generatedDirectories: 'src/target' }), /generatedDirectories/)
+  assert.throws(() => resolveConfig({ generatedDirectories: 'foo*bar' }), /generatedDirectories/)
 })
 
 test('restores the first before-image and keeps it across a second edit', async () => {
@@ -424,6 +440,26 @@ test('skipGenerated leaves generated directories unrecorded', async () => {
     const preview = await fx.engine.preview({ sessionId, workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
     assert.equal(preview.files.some(file => file.path.includes('node_modules')), false)
     assert.equal(preview.files.some(file => file.path === 'src/app.js'), true)
+  } finally {
+    await fx.cleanup()
+  }
+})
+
+test('generatedDirectories replaces the default names', async () => {
+  const fx = await fixture({ generatedDirectories: 'target,__pycache__' })
+  try {
+    const sessionId = await openTurn(fx.engine, fx.workspace)
+    const { mkdir } = await import('node:fs/promises')
+    await mkdir(join(fx.workspace, 'target'))
+    await mkdir(join(fx.workspace, 'pkg', '__pycache__'), { recursive: true })
+    await mkdir(join(fx.workspace, 'node_modules'))
+    await changeFile(fx.engine, fx.workspace, sessionId, 'c1', 'target/app.js', undefined, 'rust')
+    await changeFile(fx.engine, fx.workspace, sessionId, 'c2', 'pkg/__pycache__/a.pyc', undefined, 'py')
+    await changeFile(fx.engine, fx.workspace, sessionId, 'c3', 'node_modules/pkg.js', undefined, 'pkg')
+    const preview = await fx.engine.preview({ sessionId, workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
+    assert.equal(preview.files.some(file => file.path.startsWith('target/')), false)
+    assert.equal(preview.files.some(file => file.path.includes('__pycache__')), false)
+    assert.equal(preview.files.some(file => file.path === 'node_modules/pkg.js'), true)
   } finally {
     await fx.cleanup()
   }
