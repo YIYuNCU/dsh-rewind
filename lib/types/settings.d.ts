@@ -19,6 +19,8 @@ export interface RewindSettings {
     pathFields: string;
     excludeGlobs: string;
     skipGenerated: boolean;
+    captureExternal: boolean;
+    maxSnapshotFiles: number;
     maxFileBytes: number;
     maxCheckpointsPerSession: number;
     retentionDays: number;

@@ -21,7 +21,7 @@ export const REWIND_MANAGE_PATH = '/dsh-rewind/manage'
 
 interface SessionLike {
   readonly id: string
-  readonly header: {
+  readonly header?: {
     readonly cwd?: string
     readonly parentSession?: string
     readonly origin?: string
@@ -63,7 +63,8 @@ interface HttpResponseLike {
 }
 
 interface ReadSessionResult {
-  readonly session: { readonly id: string; readonly header: SessionLike['header'] }
+  /** `readSession` returns the header itself. `header` is only a fallback for a nested copy. */
+  readonly session: { readonly id: string; readonly cwd?: string; readonly header?: SessionLike['header'] }
   readonly events: readonly SessionEventLike[]
 }
 
@@ -90,12 +91,14 @@ export function installCapture(ctx: Context, engine: RewindEngine): void {
   const turns = new Map<string, number>()
   const calls = new Map<string, OpenCall>()
   ctx.on('session/event', (session: SessionLike, event: SessionEventLike) => {
-    if (event.type === 'turn/start' && session.header.cwd !== undefined && Number.isSafeInteger(event.data?.turn)) {
+    if (session?.id === undefined) return
+    const cwd = session.header?.cwd
+    if (event.type === 'turn/start' && cwd !== undefined && Number.isSafeInteger(event.data?.turn)) {
       const turn = event.data?.turn as number
       turns.set(session.id, turn)
       void engine.beginTurn({
         sessionId: session.id,
-        workspace: session.header.cwd,
+        workspace: cwd,
         turn,
         turnStartSeq: event.seq,
       }).catch(error => {
@@ -131,9 +134,10 @@ export function installCapture(ctx: Context, engine: RewindEngine): void {
   })
   ctx.on('tools/pre-execute', async (exec: ToolExecutionLike, next: () => Promise<unknown>) => {
     const session = exec.agent?.session
-    if (session?.header.cwd !== undefined) {
-      const subagent = session.header.origin === 'subagent' || (session.header.delegationDepth ?? 0) > 0
-      const parentSessionId = session.header.parentSession
+    const header = session?.header
+    if (session !== undefined && header?.cwd !== undefined) {
+      const subagent = header.origin === 'subagent' || (header.delegationDepth ?? 0) > 0
+      const parentSessionId = header.parentSession
       calls.set(exec.callId, {
         sessionId: session.id,
         ...(parentSessionId === undefined ? {} : { parentSessionId }),
@@ -206,7 +210,7 @@ async function handleRewind(
     const includeConflicts = stringList(body.includeConflicts)
     const read = await ctx.sessionQuery.readSession(sessionId)
     const plan = planFork(read.events, turn)
-    const workspace = requiredText(read.session.header.cwd, 'workspace')
+    const workspace = requiredText(workspaceOf(ctx, sessionId, read.session), 'workspace')
     let fileResult = { restored: [] as readonly string[], deleted: [] as readonly string[], unchanged: [] as readonly string[], skipped: [] as readonly string[] }
     if (mode !== 'messages') {
       const fingerprint = requiredText(body.fingerprint, 'fingerprint')
@@ -267,7 +271,7 @@ async function handleManage(
 async function previewPayload(ctx: RestartContext, engine: RewindEngine, sessionId: string, turn: number): Promise<unknown> {
   const read = await ctx.sessionQuery.readSession(sessionId)
   const plan = planFork(read.events, turn)
-  const workspace = requiredText(read.session.header.cwd, 'workspace')
+  const workspace = requiredText(workspaceOf(ctx, sessionId, read.session), 'workspace')
   const preview = await engine.preview({ sessionId, workspace, turn, userMessageSeq: plan.messageSeq })
   const activeSessionIds = await runningSessions(ctx, workspace)
   return {
@@ -328,8 +332,9 @@ async function runningSessions(ctx: RestartContext, workspace: string): Promise<
   const root = await canonical(workspace)
   const shared: string[] = []
   for (const agent of ctx.agents?.list() ?? []) {
-    if (agent.status !== 'running' || agent.session.header.cwd === undefined) continue
-    if (await canonical(agent.session.header.cwd) === root) shared.push(agent.session.id)
+    const cwd = agent.session.header?.cwd
+    if (agent.status !== 'running' || cwd === undefined) continue
+    if (await canonical(cwd) === root) shared.push(agent.session.id)
   }
   return shared.sort()
 }
@@ -371,6 +376,29 @@ function parseArguments(value: unknown): unknown {
   } catch {
     return undefined
   }
+}
+
+/**
+ * Working directory for a rewind request.
+ * Official `readSession` puts `cwd` on the header object it returns as `session`.
+ * @param ctx - Host context, used when the stored header has no cwd.
+ * @param sessionId - Session being rewound.
+ * @param session - Header returned by `readSession`, or a nested copy.
+ * @returns The absolute cwd, or `undefined` when none is known.
+ */
+export function workspaceOf(
+  ctx: RestartContext,
+  sessionId: string,
+  session: { readonly cwd?: string; readonly header?: { readonly cwd?: string } | undefined },
+): string | undefined {
+  const stored = textOrUndefined(session.cwd) ?? textOrUndefined(session.header?.cwd)
+  if (stored !== undefined) return stored
+  const live = ctx.agents?.list().find(agent => agent.session.id === sessionId)
+  return textOrUndefined(live?.session.header?.cwd)
+}
+
+function textOrUndefined(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined
 }
 
 function requiredText(value: unknown, name: string): string {

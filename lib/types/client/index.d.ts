@@ -1,6 +1,6 @@
 /**
  * Browser half of DSH Rewind.
- * The turn-tail slot is the supported mount. A future user-message slot is registered the same way.
+ * The completed-turn tail is the chat mount. Settings live on the Plugins tab.
  */
 import { type ReactNode } from 'react';
 interface ClientContext {
@@ -28,7 +28,7 @@ interface ClientContext {
 /** Services this browser plugin reads. */
 export declare const inject: string[];
 /**
- * Register the turn-tail action and the settings card.
+ * Register the turn-tail action and the plugin-page settings.
  * @param ctx - Client context. This plugin does not start a server.
  */
 export declare function apply(ctx: ClientContext): void;

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { lstat, open, realpath } from 'node:fs/promises'
-import { isAbsolute, resolve } from 'node:path'
+import { lstat, open, readdir, realpath } from 'node:fs/promises'
+import { isAbsolute, join, resolve } from 'node:path'
 import type { ResolvedRewindConfig } from './types.js'
 import type { GapReason } from './types.js'
 import { hasSymlinkParent, isNodeError, relativePosix } from './paths.js'
@@ -107,6 +107,64 @@ export async function readCandidate(
   } finally {
     await handle.close()
   }
+}
+
+/** Eligible files found by a turn-start walk. `complete` is false when the walk stopped early. */
+export interface WorkspaceScan {
+  readonly files: readonly { readonly relativePath: string; readonly captured: CapturedBytes }[]
+  readonly complete: boolean
+}
+
+/**
+ * Read regular files inside a workspace for a turn-start snapshot.
+ * Generated directories, excluded globs, symlinks, hard links, and oversized files are skipped.
+ * A skipped path is not a deletion candidate.
+ * @param workspace - Canonical workspace root.
+ * @param config - Size, exclusion, and snapshot limits.
+ * @returns Captured files and whether every eligible file fit in the cap.
+ */
+export async function scanWorkspace(
+  workspace: string,
+  config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs' | 'maxSnapshotFiles'>,
+): Promise<WorkspaceScan> {
+  const files: { relativePath: string; captured: CapturedBytes }[] = []
+  let complete = true
+  const walk = async (directory: string): Promise<void> => {
+    if (!complete) return
+    let entries
+    try {
+      entries = await readdir(directory, { withFileTypes: true })
+    } catch {
+      complete = false
+      return
+    }
+    for (const entry of entries) {
+      if (!complete || files.length >= config.maxSnapshotFiles) {
+        complete = false
+        return
+      }
+      const absolute = join(directory, entry.name)
+      if (entry.isSymbolicLink()) continue
+      if (entry.isDirectory()) {
+        if (config.skipGenerated && isGeneratedPath(entry.name)) continue
+        await walk(absolute)
+        continue
+      }
+      if (!entry.isFile()) continue
+      const relativePath = relativePosix(workspace, absolute)
+      if (relativePath === undefined) continue
+      if ((config.skipGenerated && isGeneratedPath(relativePath)) || matchesGlob(relativePath, config.excludeGlobs)) continue
+      const resolved = await readCandidate(workspace, absolute, { maxFileBytes: config.maxFileBytes, allowOutsideWorkspace: false }).catch(() => undefined)
+      if (resolved === undefined) {
+        complete = false
+        continue
+      }
+      if ('reason' in resolved || resolved.captured.hash === null) continue
+      files.push({ relativePath: resolved.relativePath, captured: resolved.captured })
+    }
+  }
+  await walk(workspace)
+  return { files, complete }
 }
 
 /** Canonicalize a directory, or return it unchanged when it does not exist yet. */

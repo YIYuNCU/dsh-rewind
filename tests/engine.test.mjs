@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { link, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -86,9 +86,9 @@ test('restores the first before-image and keeps it across a second edit', async 
 test('a failed tool does not become a checkpoint', async () => {
   const fx = await fixture()
   try {
-    const sessionId = await openTurn(fx.engine, fx.workspace)
     const path = join(fx.workspace, 'a.txt')
     await writeFile(path, 'old')
+    const sessionId = await openTurn(fx.engine, fx.workspace)
     await fx.engine.captureBefore({
       sessionId, subagent: false, callId: 'c1', toolName: 'edit',
       args: { file_path: 'a.txt', old_string: 'old', new_string: 'new' },
@@ -333,6 +333,57 @@ test('subagent edits attach to the parent turn and a disabled engine records not
     })
     const after = await fx.engine.preview({ sessionId: 'parent', workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
     assert.equal(after.files.some(file => file.path === 'b.txt'), false)
+  } finally {
+    await fx.cleanup()
+  }
+})
+
+test('manual and script edits between turns restore with the earlier turn', async () => {
+  const fx = await fixture()
+  try {
+    await mkdir(join(fx.workspace, 'node_modules'), { recursive: true })
+    await writeFile(join(fx.workspace, 'hand.txt'), 'v0')
+    await writeFile(join(fx.workspace, 'tool.txt'), 'v0')
+    await writeFile(join(fx.workspace, 'node_modules', 'dep.txt'), 'pkg')
+    const sessionId = await openTurn(fx.engine, fx.workspace, 1)
+    await changeFile(fx.engine, fx.workspace, sessionId, 'c1', 'tool.txt', 'v0', 'v1', 'edit')
+    await writeFile(join(fx.workspace, 'hand.txt'), 'by-hand')
+    await writeFile(join(fx.workspace, 'script.txt'), 'by-script')
+    await writeFile(join(fx.workspace, 'node_modules', 'dep.txt'), 'changed')
+    await openTurn(fx.engine, fx.workspace, 2, sessionId)
+    const later = await fx.engine.preview({ sessionId, workspace: fx.workspace, turn: 2, userMessageSeq: 21 })
+    assert.equal(later.files.some(file => file.path === 'hand.txt' || file.path === 'script.txt'), false)
+    const preview = await fx.engine.preview({ sessionId, workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
+    const hand = preview.files.find(file => file.path === 'hand.txt')
+    const script = preview.files.find(file => file.path === 'script.txt')
+    assert.equal(hand?.state, 'clean')
+    assert.equal(hand?.action, 'restore')
+    assert.equal(script?.action, 'delete')
+    assert.equal(preview.files.some(file => file.path.includes('node_modules')), false)
+    await fx.engine.apply({ sessionId, workspace: fx.workspace, turn: 1, fingerprint: preview.fingerprint })
+    await fx.engine.commit(fx.workspace)
+    assert.equal(await readFile(join(fx.workspace, 'hand.txt'), 'utf8'), 'v0')
+    assert.equal(await readFile(join(fx.workspace, 'tool.txt'), 'utf8'), 'v0')
+    await assert.rejects(readFile(join(fx.workspace, 'script.txt')))
+    assert.equal(await readFile(join(fx.workspace, 'node_modules', 'dep.txt'), 'utf8'), 'changed')
+  } finally {
+    await fx.cleanup()
+  }
+})
+
+test('external capture can be turned off', async () => {
+  const fx = await fixture({ captureExternal: false })
+  try {
+    await writeFile(join(fx.workspace, 'hand.txt'), 'v0')
+    const sessionId = await openTurn(fx.engine, fx.workspace, 1)
+    await writeFile(join(fx.workspace, 'hand.txt'), 'by-hand')
+    await writeFile(join(fx.workspace, 'script.txt'), 'by-script')
+    const preview = await fx.engine.preview({ sessionId, workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
+    assert.equal(preview.totalFiles, 0)
+    await fx.engine.apply({ sessionId, workspace: fx.workspace, turn: 1, fingerprint: preview.fingerprint })
+    await fx.engine.commit(fx.workspace)
+    assert.equal(await readFile(join(fx.workspace, 'hand.txt'), 'utf8'), 'by-hand')
+    assert.equal(await readFile(join(fx.workspace, 'script.txt'), 'utf8'), 'by-script')
   } finally {
     await fx.cleanup()
   }

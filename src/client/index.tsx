@@ -1,14 +1,12 @@
 /**
  * Browser half of DSH Rewind.
- * The turn-tail slot is the supported mount. A future user-message slot is registered the same way.
+ * The completed-turn tail is the chat mount. Settings live on the Plugins tab.
  */
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react'
-import { Button, Modal, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Modal, Switch, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 
 type Lang = 'zh' | 'en'
 type Mode = 'both' | 'code' | 'messages'
-type FieldKind = 'bool' | 'text' | 'number' | 'select'
-
 interface SettingsValue {
   enabled: boolean
   captureSubagents: boolean
@@ -18,6 +16,7 @@ interface SettingsValue {
   pathFields: string
   excludeGlobs: string
   skipGenerated: boolean
+  captureExternal: boolean
   maxFileBytes: number
   maxCheckpointsPerSession: number
   retentionDays: number
@@ -92,40 +91,38 @@ interface ClientContext {
 }
 
 interface TurnProps {
-  readonly turn?: number
+  /** 0.2.0-rc.2 passes a turn location; a bare number is accepted too. */
+  readonly turn?: number | { readonly turn?: number }
   readonly sessionId?: string
   readonly openRestoredSession?: (sessionId: string, prompt: string) => Promise<void>
 }
 
 interface SettingsProps {
+  readonly view?: string
   readonly scope?: SettingsScope
 }
 
+type SettingsGroup = 'capture' | 'restore' | 'storage'
+
 const UNAVAILABLE: SettingsSnapshot = { status: 'unavailable' }
-const FIELD_DEFS: readonly { readonly key: keyof SettingsValue; readonly kind: FieldKind; readonly options?: readonly string[] }[] = [
-  { key: 'enabled', kind: 'bool' },
-  { key: 'captureSubagents', kind: 'bool' },
-  { key: 'shellPolicy', kind: 'select', options: ['gap', 'ignore'] },
-  { key: 'shellTools', kind: 'text' },
-  { key: 'extraFileTools', kind: 'text' },
-  { key: 'pathFields', kind: 'text' },
-  { key: 'excludeGlobs', kind: 'text' },
-  { key: 'skipGenerated', kind: 'bool' },
-  { key: 'maxFileBytes', kind: 'number' },
-  { key: 'maxCheckpointsPerSession', kind: 'number' },
-  { key: 'retentionDays', kind: 'number' },
-  { key: 'maxSessionBytes', kind: 'number' },
-  { key: 'maxStorageBytes', kind: 'number' },
-  { key: 'maxStoredTurns', kind: 'number' },
-  { key: 'conflictPolicy', kind: 'select', options: ['ask', 'skip', 'overwrite'] },
-  { key: 'restoreCreatedFiles', kind: 'bool' },
-  { key: 'blockWhileAgentsRun', kind: 'bool' },
-  { key: 'allowOutsideWorkspace', kind: 'bool' },
-  { key: 'previewTrust', kind: 'select', options: ['content', 'metadata'] },
-  { key: 'putPromptInComposer', kind: 'bool' },
-  { key: 'maxPreviewFiles', kind: 'number' },
-  { key: 'staleLockMs', kind: 'number' },
-  { key: 'originCheck', kind: 'select', options: ['same-origin', 'off'] },
+const MIB = 1024 * 1024
+const VISIBLE_FIELDS: readonly {
+  readonly key: keyof SettingsValue
+  readonly kind: 'bool' | 'number' | 'select' | 'mib'
+  readonly group: SettingsGroup
+  readonly options?: readonly string[]
+}[] = [
+  { key: 'skipGenerated', kind: 'bool', group: 'capture' },
+  { key: 'captureExternal', kind: 'bool', group: 'capture' },
+  { key: 'captureSubagents', kind: 'bool', group: 'capture' },
+  { key: 'shellPolicy', kind: 'select', group: 'capture', options: ['gap', 'ignore'] },
+  { key: 'conflictPolicy', kind: 'select', group: 'restore', options: ['ask', 'skip', 'overwrite'] },
+  { key: 'restoreCreatedFiles', kind: 'bool', group: 'restore' },
+  { key: 'putPromptInComposer', kind: 'bool', group: 'restore' },
+  { key: 'blockWhileAgentsRun', kind: 'bool', group: 'restore' },
+  { key: 'retentionDays', kind: 'number', group: 'storage' },
+  { key: 'maxStorageBytes', kind: 'mib', group: 'storage' },
+  { key: 'maxStoredTurns', kind: 'number', group: 'storage' },
 ]
 
 const copy = {
@@ -134,8 +131,8 @@ const copy = {
     button: '回退这一轮',
     buttonTip: '把这一轮开始前的文件改回去，并另开会话。不会改掉原来的记录。',
     close: '关闭',
-    warning: '手改过的文件，以及 shell、run_code 改过的内容，不会自动撤掉。',
-    shell: '这一轮运行过命令。命令造成的改动不在回退范围内。',
+    warning: '生成目录、符号链接、硬链接，以及超过大小或数量上限的文件，不会自动撤掉。',
+    shell: '这一轮运行过命令。命令改过的合格文件会回到这一轮开始时的内容。',
     blocked: '这个工作区还有正在运行的会话，暂时不能改文件。',
     hidden: (count: number) => `还有 ${String(count)} 个文件没列在这里，但回退会一起处理。`,
     empty: '这一轮没有可回退的文件改动。仍可以只回退对话。',
@@ -146,41 +143,35 @@ const copy = {
     messages: '只回退对话',
     working: '正在回退…',
     failed: '回退没有完成。',
-    settingsTitle: '回退',
+    settingsTitle: '设置',
     settingsMissing: '设置服务还没就绪。',
-    storage: '存储目录（改完要重启）',
-    purge: '清除这个会话的回退记录',
-    purgeAll: '清除全部回退记录',
-    usage: '已保存的回退',
+    storage: '存储目录',
+    purge: '清除',
+    purgeAll: '清除全部',
+    usage: '已保存',
     none: '还没有回退记录。',
     bytes: '字节',
     checkpoints: '个检查点',
+    mib: 'MiB',
+    groups: { capture: '记录', restore: '回退', storage: '存储' },
+    options: {
+      shellPolicy: { gap: '标明跑过命令', ignore: '不标明' },
+      conflictPolicy: { ask: '询问', skip: '跳过', overwrite: '覆盖' },
+    },
     actions: { restore: '恢复修改前', delete: '删除新建文件', unchanged: '已经是修改前' },
     states: { clean: '可回退', conflict: '有冲突', gap: '跳过' },
     fields: {
-      enabled: ['启用捕获', '关闭后不再记录新的修改，已有记录仍可回退。'],
-      captureSubagents: ['记录子代理的文件工具', '子代理改的文件算到父会话当前这一轮。'],
-      shellPolicy: ['命令工具', 'gap 会标明跑过命令；ignore 则不标明。都不会给命令做快照。'],
-      shellTools: ['命令工具名', '逗号分隔。这些工具只记一笔缺口。'],
-      extraFileTools: ['额外文件工具名', '逗号分隔。配合下面的参数名读取路径。'],
-      pathFields: ['路径参数名', '逗号分隔，例如 file_path,path。'],
-      excludeGlobs: ['排除路径', '每行一个 glob。匹配到的文件不记录。'],
-      skipGenerated: ['跳过生成目录', '另外不记录 node_modules、.git、dist、coverage 和 .dsh。你自己的排除列表仍然有效。'],
-      maxFileBytes: ['单文件上限', '超过这个字节数的文件只记缺口，不存内容。'],
-      maxCheckpointsPerSession: ['每会话保留条数', '超出后丢掉最旧的记录。'],
+      captureSubagents: ['记录子代理', '子代理改的文件算到父会话当前这一轮。'],
+      shellPolicy: ['命令工具', '只标明这一轮跑过命令，不会给命令做快照。'],
+      skipGenerated: ['跳过生成目录', '不记录 node_modules、.git、dist、coverage 和 .dsh。'],
+      captureExternal: ['记录回合之间的改动', '每轮开始时记下工作区。之后的手改和脚本改动，回退到这一轮时会撤掉。'],
       retentionDays: ['保留天数', '0 表示不按天数删除。'],
-      maxSessionBytes: ['每会话容量', '超出后从最旧的记录开始丢。'],
-      maxStorageBytes: ['最大存储空间', '全部会话加在一起的字节上限。超出后丢掉最旧的一轮，至少保留一轮。'],
-      maxStoredTurns: ['最大存储轮数', '全部会话加在一起最多保留这么多轮。超出后丢掉最旧的一轮。'],
-      conflictPolicy: ['冲突策略', 'ask 要你勾选；skip 跳过；overwrite 直接覆盖。'],
-      restoreCreatedFiles: ['删除本轮新建的文件', '关闭后，代理新建的文件会留在原地。'],
+      maxStorageBytes: ['最大存储空间', '全部会话加在一起的上限。超出后丢掉最旧的一轮，至少保留一轮。'],
+      maxStoredTurns: ['最大存储轮数', '全部会话加在一起最多保留这么多轮。'],
+      conflictPolicy: ['文件冲突', '文件已经和记录不一致时怎么处理。'],
+      restoreCreatedFiles: ['删除本轮新建的文件', '关闭后，这一轮新建的文件会留在原地。'],
       blockWhileAgentsRun: ['运行中禁止改文件', '同一工作区还有代理在跑时，不允许回退代码。'],
-      allowOutsideWorkspace: ['允许工作区外的路径', '默认拒绝。打开后才会记录并回退工作区外面的文件。'],
-      previewTrust: ['预览校验', 'content 重新计算哈希；metadata 在大小和时间没变时少读一次。'],
       putPromptInComposer: ['把原话放回输入框', '回退对话后，把当时的用户消息放进新会话的输入框。'],
-      maxPreviewFiles: ['预览最多显示', '对话框里最多列这么多行。指纹仍覆盖全部路径。'],
-      staleLockMs: ['过期锁毫秒', '持有者进程已经不在、并且超过这个时间后，才允许抢走锁。'],
-      originCheck: ['来源检查', 'same-origin 拒绝跨站请求。off 只适合可信的本机端口。'],
     } as Record<string, readonly [string, string]>,
   },
   en: {
@@ -188,8 +179,8 @@ const copy = {
     button: 'Rewind this turn',
     buttonTip: 'Restore files from before this turn and open a forked session. The original session stays intact.',
     close: 'Close',
-    warning: 'Manual edits, and anything a shell or run_code changed, are not undone.',
-    shell: 'A command ran during this turn. Its effects are outside the rewind.',
+    warning: 'Generated directories, symlinks, hard links, and files past the size or count limit are not undone.',
+    shell: 'A command ran during this turn. Eligible files it changed go back to the start of the turn.',
     blocked: 'An agent is still running in this workspace, so files cannot be changed.',
     hidden: (count: number) => `${String(count)} more files are hidden here but are still included.`,
     empty: 'This turn has no restorable file edits. You can still rewind the conversation.',
@@ -200,41 +191,35 @@ const copy = {
     messages: 'Rewind conversation only',
     working: 'Rewinding…',
     failed: 'Rewind did not finish.',
-    settingsTitle: 'Rewind',
+    settingsTitle: 'Settings',
     settingsMissing: 'Settings are not available yet.',
-    storage: 'Storage directory (restart to change)',
-    purge: 'Delete rewind data for this session',
-    purgeAll: 'Delete all rewind data',
-    usage: 'Saved rewinds',
+    storage: 'Storage directory',
+    purge: 'Delete',
+    purgeAll: 'Delete all',
+    usage: 'Saved',
     none: 'No rewind data yet.',
     bytes: 'bytes',
     checkpoints: 'checkpoints',
+    mib: 'MiB',
+    groups: { capture: 'Capture', restore: 'Rewind', storage: 'Storage' },
+    options: {
+      shellPolicy: { gap: 'Mark that a command ran', ignore: 'Do not mark it' },
+      conflictPolicy: { ask: 'Ask', skip: 'Skip', overwrite: 'Overwrite' },
+    },
     actions: { restore: 'Restore previous bytes', delete: 'Delete created file', unchanged: 'Already at previous bytes' },
     states: { clean: 'Ready', conflict: 'Conflict', gap: 'Skip' },
     fields: {
-      enabled: ['Capture edits', 'When off, new edits are not recorded. Existing records can still be restored.'],
-      captureSubagents: ['Capture subagent file tools', 'Attribute a subagent edit to the parent session’s open turn.'],
-      shellPolicy: ['Command tools', 'gap marks that a command ran. ignore does not. Neither snapshots the command.'],
-      shellTools: ['Command tool names', 'Comma-separated. These tools only leave a gap.'],
-      extraFileTools: ['Extra file tool names', 'Comma-separated. Their path is read from the fields below.'],
-      pathFields: ['Path argument names', 'Comma-separated, for example file_path,path.'],
-      excludeGlobs: ['Exclude globs', 'One glob per line. Matches are not recorded.'],
-      skipGenerated: ['Skip generated directories', 'Also skip node_modules, .git, dist, coverage, and .dsh. Your own exclude list still applies.'],
-      maxFileBytes: ['Per-file byte limit', 'A larger file is a gap, not a stored before-image.'],
-      maxCheckpointsPerSession: ['Checkpoints per session', 'Older checkpoints are dropped past this count.'],
+      captureSubagents: ['Capture subagents', 'Attribute a subagent edit to the parent session’s open turn.'],
+      shellPolicy: ['Command tools', 'Only marks that a command ran. The command itself is not snapshotted.'],
+      skipGenerated: ['Skip generated directories', 'Do not record node_modules, .git, dist, coverage, or .dsh.'],
+      captureExternal: ['Record edits between turns', 'Snapshot the workspace when a turn starts. Later manual and script edits are undone when you rewind to that turn.'],
       retentionDays: ['Retention days', 'Zero disables the age sweep.'],
-      maxSessionBytes: ['Bytes per session', 'Oldest checkpoints are dropped until the session fits.'],
-      maxStorageBytes: ['Maximum storage', 'Byte cap across every session. The oldest turn is dropped until it fits, and at least one turn is kept.'],
-      maxStoredTurns: ['Maximum stored turns', 'How many turns are kept across every session. The oldest turn is dropped past this count.'],
-      conflictPolicy: ['Conflicts', 'ask requires a check. skip leaves them. overwrite replaces them.'],
-      restoreCreatedFiles: ['Delete files created this turn', 'When off, files the agent created are left in place.'],
+      maxStorageBytes: ['Maximum storage', 'Cap across every session. The oldest turn is dropped until it fits, and at least one turn is kept.'],
+      maxStoredTurns: ['Maximum stored turns', 'How many turns are kept across every session.'],
+      conflictPolicy: ['File conflicts', 'What to do when a file no longer matches the recorded bytes.'],
+      restoreCreatedFiles: ['Delete files created this turn', 'When off, files created during the turn stay in place.'],
       blockWhileAgentsRun: ['Block while agents run', 'Refuse a file rewind while any agent is running in the workspace.'],
-      allowOutsideWorkspace: ['Allow paths outside the workspace', 'Off by default. On records and restores those paths too.'],
-      previewTrust: ['Preview check', 'content hashes the file. metadata skips the read when size and mtime still match.'],
       putPromptInComposer: ['Return the prompt to the composer', 'After a conversation rewind, put that user message in the new draft.'],
-      maxPreviewFiles: ['Preview row limit', 'The dialog lists at most this many files. The fingerprint still covers every path.'],
-      staleLockMs: ['Stale lock milliseconds', 'A lock can be taken only after its owner process is gone and this age has passed.'],
-      originCheck: ['Origin check', 'same-origin rejects cross-site requests. off is only for a trusted local listener.'],
     } as Record<string, readonly [string, string]>,
   },
 } as const
@@ -285,7 +270,7 @@ function followHostLocale(ctx: ClientContext): () => void {
 export const inject = ['slots', 'sessions', 'conversation']
 
 /**
- * Register the turn-tail action and the settings card.
+ * Register the turn-tail action and the plugin-page settings.
  * @param ctx - Client context. This plugin does not start a server.
  */
 export function apply(ctx: ClientContext): void {
@@ -302,34 +287,26 @@ export function apply(ctx: ClientContext): void {
       inject: (sessionId: string) => ({ sessionId, openRestoredSession }),
     }, RewindTurnButton as (props: Record<string, unknown>) => ReactNode)
   })
-  ctx.slots.inject('conversation.chat.user-actions', () => {
+  ctx.slots.inject('plugins.bundle.config', () => {
     ctx.slots.register({
-      name: 'conversation.chat.user-actions',
-      id: 'dsh-rewind',
-      order: 20,
-      inject: (sessionId: string) => ({ sessionId, openRestoredSession }),
-    }, RewindTurnButton as (props: Record<string, unknown>) => ReactNode)
-  })
-  const settings = () => ({ scope: settingsScope(ctx) })
-  ctx.slots.inject('settings.plugin.item', () => {
-    ctx.slots.register({ name: 'settings.plugin.item', key: 'dsh-rewind', inject: settings }, RewindSettingsCard as (props: Record<string, unknown>) => ReactNode)
-  })
-  ctx.slots.inject('settings.plugins.tab', () => {
-    ctx.slots.register({
-      name: 'settings.plugins.tab',
-      id: 'dsh-rewind',
-      order: 80,
-      label: () => copy[lang].settingsTitle,
-      inject: settings,
+      name: 'plugins.bundle.config',
+      key: 'dsh-rewind',
+      inject: () => ({ scope: settingsScope(ctx) }),
     }, RewindSettingsCard as (props: Record<string, unknown>) => ReactNode)
   })
+}
+
+function turnOf(value: TurnProps['turn']): number | undefined {
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return value
+  if (typeof value === 'object' && value !== null && typeof value.turn === 'number' && Number.isSafeInteger(value.turn)) return value.turn
+  return undefined
 }
 
 function RewindTurnButton(props: TurnProps): ReactNode {
   const text = copy[useLang()]
   const [open, setOpen] = useState(false)
-  if (!Number.isSafeInteger(props.turn) || props.sessionId === undefined || props.sessionId === '') return null
-  const turn = props.turn as number
+  const turn = turnOf(props.turn)
+  if (turn === undefined || props.sessionId === undefined || props.sessionId === '') return null
   const sessionId = props.sessionId
   return (
     <span data-dsh-rewind="turn">
@@ -398,7 +375,6 @@ function RewindDialog(props: {
   return (
     <Modal open title={props.title} closeLabel={props.closeLabel} onClose={props.onClose} description={text.warning}>
       <div data-dsh-rewind="dialog">
-        <p>{text.warning}</p>
         {preview?.shellGap === true ? <p>{text.shell}</p> : null}
         {preview?.restoreBlocked === true ? <p>{text.blocked} {preview.activeSessionIds.join(', ')}</p> : null}
         {preview !== undefined && preview.totalFiles === 0 ? <p>{text.empty}</p> : null}
@@ -433,7 +409,7 @@ function RewindDialog(props: {
   )
 }
 
-function RewindSettingsCard({ scope }: SettingsProps): ReactNode {
+function RewindSettingsCard({ view, scope }: SettingsProps): ReactNode {
   const text = copy[useLang()]
   const snapshot = useSyncExternalStore(
     (listener) => scope?.subscribe(listener) ?? (() => {}),
@@ -445,91 +421,126 @@ function RewindSettingsCard({ scope }: SettingsProps): ReactNode {
   const [error, setError] = useState<string | undefined>()
   const value = snapshot.value
   useEffect(() => {
+    if (view !== undefined && view !== 'page') return undefined
+    let active = true
+    void requestJson<{ readonly sessions?: readonly UsageRow[]; readonly storageDir?: string }>('/dsh-rewind/manage')
+      .then((body) => {
+        if (!active) return
+        setUsage(body.sessions ?? [])
+        setStorageDir(body.storageDir ?? '')
+      })
+      .catch((caught: unknown) => { if (active) setError(messageOf(caught)) })
+    return () => { active = false }
+  }, [view])
+  if (view !== undefined && view !== 'page') return null
+  const refresh = (): void => {
     void requestJson<{ readonly sessions?: readonly UsageRow[]; readonly storageDir?: string }>('/dsh-rewind/manage')
       .then((body) => {
         setUsage(body.sessions ?? [])
         setStorageDir(body.storageDir ?? '')
       })
       .catch((caught: unknown) => { setError(messageOf(caught)) })
-  }, [])
-  const refresh = (): void => {
-    void requestJson<{ readonly sessions?: readonly UsageRow[]; readonly storageDir?: string }>('/dsh-rewind/manage')
-      .then((body) => {
-        setUsage(body.sessions ?? [])
-        setStorageDir(body.storageDir ?? value?.storageDir ?? '')
-      })
-      .catch((caught: unknown) => { setError(messageOf(caught)) })
   }
+  const write = (key: string, next: boolean | number | string): void => {
+    void scope?.set(key, next).catch((caught: unknown) => { setError(messageOf(caught)) })
+  }
+  const groups: readonly SettingsGroup[] = ['capture', 'restore', 'storage']
   return (
-    <section data-dsh-rewind="settings">
+    <div data-dsh-rewind="settings">
       <h3>{text.settingsTitle}</h3>
-      {value === undefined ? <p>{text.settingsMissing}</p> : null}
-      {value !== undefined ? FIELD_DEFS.map(field => {
-        const labels = text.fields[field.key]
-        const current = value[field.key]
-        return (
-          <label key={field.key}>
-            <span>{labels?.[0] ?? field.key}</span>
-            {field.kind === 'bool' ? (
-              <input
-                type="checkbox"
-                checked={current === true}
-                disabled={snapshot.writable === false}
-                onChange={(event) => { void scope?.set(field.key, event.target.checked).catch((caught: unknown) => { setError(messageOf(caught)) }) }}
-              />
-            ) : null}
-            {field.kind === 'text' ? (
-              <textarea
-                value={typeof current === 'string' ? current : ''}
-                disabled={snapshot.writable === false}
-                onChange={(event) => { void scope?.set(field.key, event.target.value).catch((caught: unknown) => { setError(messageOf(caught)) }) }}
-              />
-            ) : null}
-            {field.kind === 'number' ? (
-              <input
-                type="number"
-                value={typeof current === 'number' ? current : 0}
-                disabled={snapshot.writable === false}
-                onChange={(event) => {
-                  const parsed = Number(event.target.value)
-                  if (!Number.isSafeInteger(parsed)) return
-                  void scope?.set(field.key, parsed).catch((caught: unknown) => { setError(messageOf(caught)) })
-                }}
-              />
-            ) : null}
-            {field.kind === 'select' ? (
-              <select
-                value={typeof current === 'string' ? current : field.options?.[0]}
-                disabled={snapshot.writable === false}
-                onChange={(event) => { void scope?.set(field.key, event.target.value).catch((caught: unknown) => { setError(messageOf(caught)) }) }}
-              >
-                {(field.options ?? []).map(option => <option key={option} value={option}>{option}</option>)}
-              </select>
-            ) : null}
-            <small>{labels?.[1]}</small>
-          </label>
-        )
-      }) : null}
-      <p>{text.storage}</p>
-      <code>{storageDir}</code>
-      <div>
-        <Button type="button" variant="ghost" onClick={refresh}>{text.usage}</Button>
-        <Button type="button" variant="outline" onClick={() => { void purge(undefined).then(refresh).catch((caught: unknown) => { setError(messageOf(caught)) }) }}>{text.purgeAll}</Button>
-      </div>
-      {usage.length === 0 ? <p>{text.none}</p> : (
-        <ul>
-          {usage.map(row => (
-            <li key={row.sessionId}>
-              <code>{row.sessionId}</code>
-              <span>{String(row.checkpoints)} {text.checkpoints} · {String(row.bytes)} {text.bytes}</span>
-              <Button type="button" variant="ghost" onClick={() => { void purge(row.sessionId).then(refresh).catch((caught: unknown) => { setError(messageOf(caught)) }) }}>{text.purge}</Button>
-            </li>
-          ))}
-        </ul>
-      )}
+      {value === undefined ? <p>{text.settingsMissing}</p> : groups.map(group => (
+        <section key={group} data-dsh-rewind="group">
+          <h4>{text.groups[group]}</h4>
+          {VISIBLE_FIELDS.filter(field => field.group === group).map(field => {
+            const labels = text.fields[field.key]
+            const current = value[field.key]
+            const disabled = snapshot.writable === false
+            return (
+              <div key={field.key} data-dsh-rewind="row">
+                <div data-dsh-rewind="copy">
+                  <strong>{labels?.[0] ?? field.key}</strong>
+                  <span>{labels?.[1]}</span>
+                </div>
+                <div data-dsh-rewind="control">
+                  {field.kind === 'bool' ? (
+                    <Switch
+                      checked={current === true}
+                      disabled={disabled}
+                      label={labels?.[0] ?? field.key}
+                      onChange={(next) => { write(field.key, next) }}
+                    />
+                  ) : null}
+                  {field.kind === 'select' ? (
+                    <select
+                      aria-label={labels?.[0] ?? field.key}
+                      value={typeof current === 'string' ? current : field.options?.[0]}
+                      disabled={disabled}
+                      onChange={(event) => { write(field.key, event.target.value) }}
+                    >
+                      {(field.options ?? []).map(option => (
+                        <option key={option} value={option}>{optionLabel(text, field.key, option)}</option>
+                      ))}
+                    </select>
+                  ) : null}
+                  {field.kind === 'number' || field.kind === 'mib' ? (
+                    <label>
+                      <input
+                        aria-label={labels?.[0] ?? field.key}
+                        type="number"
+                        min={field.key === 'retentionDays' ? 0 : 1}
+                        step={1}
+                        value={shownNumber(field.kind, current)}
+                        disabled={disabled}
+                        onChange={(event) => {
+                          const parsed = Number(event.target.value)
+                          if (!Number.isSafeInteger(parsed) || parsed < (field.key === 'retentionDays' ? 0 : 1)) return
+                          write(field.key, field.kind === 'mib' ? parsed * MIB : parsed)
+                        }}
+                      />
+                      {field.kind === 'mib' ? <span data-dsh-rewind="unit">{text.mib}</span> : null}
+                    </label>
+                  ) : null}
+                </div>
+              </div>
+            )
+          })}
+        </section>
+      ))}
+      <section data-dsh-rewind="group">
+        <div data-dsh-rewind="usage-head">
+          <h4>{text.usage}</h4>
+          <Button type="button" variant="outline" size="sm" onClick={() => { void purge(undefined).then(refresh).catch((caught: unknown) => { setError(messageOf(caught)) }) }}>{text.purgeAll}</Button>
+        </div>
+        {storageDir !== '' ? <p data-dsh-rewind="path"><span>{text.storage}</span> <code>{storageDir}</code></p> : null}
+        {usage.length === 0 ? <p data-dsh-rewind="empty">{text.none}</p> : (
+          <ul>
+            {usage.map(row => (
+              <li key={row.sessionId} data-dsh-rewind="row">
+                <div data-dsh-rewind="copy">
+                  <code>{row.sessionId}</code>
+                  <span>{String(row.checkpoints)} {text.checkpoints} · {String(row.bytes)} {text.bytes}</span>
+                </div>
+                <Button type="button" variant="ghost" size="sm" onClick={() => { void purge(row.sessionId).then(refresh).catch((caught: unknown) => { setError(messageOf(caught)) }) }}>{text.purge}</Button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
       {error !== undefined ? <p role="alert">{error}</p> : null}
-    </section>
+    </div>
   )
+}
+
+function optionLabel(text: (typeof copy)[Lang], field: string, option: string): string {
+  const table: Record<string, string> | undefined = field === 'shellPolicy' || field === 'conflictPolicy'
+    ? text.options[field]
+    : undefined
+  return table?.[option] ?? option
+}
+
+function shownNumber(kind: 'number' | 'mib', current: SettingsValue[keyof SettingsValue] | undefined): number {
+  if (typeof current !== 'number' || !Number.isFinite(current)) return 0
+  return kind === 'mib' ? Math.max(1, Math.round(current / MIB)) : current
 }
 
 function settingsScope(ctx: ClientContext): SettingsScope | undefined {
@@ -589,9 +600,24 @@ function mountStyles(): () => void {
   tag.dataset.dshRewindStyle = 'true'
   tag.textContent = [
     '[data-dsh-rewind="dialog"] ul { max-height: 240px; overflow: auto; padding: 0; list-style: none; }',
-    '[data-dsh-rewind="dialog"] li, [data-dsh-rewind="settings"] label, [data-dsh-rewind="settings"] li { display: flex; gap: 8px; align-items: center; margin: 6px 0; }',
-    '[data-dsh-rewind="settings"] textarea { min-height: 64px; width: 100%; }',
+    '[data-dsh-rewind="dialog"] li { display: flex; gap: 8px; align-items: center; margin: 6px 0; }',
     '[data-dsh-rewind="actions"] { display: flex; gap: 8px; flex-wrap: wrap; }',
+    '[data-dsh-rewind="settings"] { display: flex; flex-direction: column; gap: 28px; }',
+    '[data-dsh-rewind="settings"] h3, [data-dsh-rewind="settings"] h4 { margin: 0; font-weight: 500; }',
+    '[data-dsh-rewind="settings"] h3 { font-size: 14px; line-height: 20px; }',
+    '[data-dsh-rewind="settings"] h4 { margin-bottom: 4px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }',
+    '[data-dsh-rewind="row"] { display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 52px; padding: 10px 2px; border-bottom: 0.5px solid var(--dsw-alias-border-l2); }',
+    '[data-dsh-rewind="copy"] { display: flex; flex-direction: column; gap: 2px; min-width: 0; }',
+    '[data-dsh-rewind="copy"] strong { font-size: 13px; font-weight: 500; line-height: 20px; }',
+    '[data-dsh-rewind="copy"] span, [data-dsh-rewind="empty"], [data-dsh-rewind="path"] { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }',
+    '[data-dsh-rewind="control"] select, [data-dsh-rewind="control"] input { height: 32px; min-width: 148px; padding: 0 10px; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 13px; }',
+    '[data-dsh-rewind="control"] label { display: flex; align-items: center; gap: 8px; }',
+    '[data-dsh-rewind="unit"] { font-size: 12px; color: var(--dsw-alias-label-secondary); }',
+    '[data-dsh-rewind="usage-head"] { display: flex; align-items: center; justify-content: space-between; gap: 12px; }',
+    '[data-dsh-rewind="settings"] ul { margin: 0; padding: 0; list-style: none; }',
+    '[data-dsh-rewind="path"] { margin: 8px 2px 0; }',
+    '[data-dsh-rewind="path"] code, [data-dsh-rewind="copy"] code { font-size: 12px; overflow-wrap: anywhere; }',
+    '[data-dsh-rewind="empty"] { margin: 8px 2px 0; }',
   ].join('\n')
   document.head.appendChild(tag)
   return () => { tag.remove() }

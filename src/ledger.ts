@@ -3,7 +3,7 @@ import { mkdir, open, readdir, readFile, rename, rm, stat, unlink, writeFile } f
 import { join } from 'node:path'
 import { RewindError } from './errors.js'
 import { isNodeError } from './paths.js'
-import { REWIND_FORMAT_VERSION, type FileAttribution, type ResolvedRewindConfig, type SessionUsage, type TurnRecord } from './types.js'
+import { REWIND_FORMAT_VERSION, type BaselineEntry, type FileAttribution, type ResolvedRewindConfig, type SessionUsage, type TurnRecord } from './types.js'
 
 /** One in-flight file restore, durable across a crash. */
 export interface RestoreJournal {
@@ -389,6 +389,7 @@ function parseTurn(value: unknown): TurnRecord {
     shellGap: record.shellGap === true,
     files: parseFiles(record.files),
     gaps: Array.isArray(record.gaps) ? record.gaps.filter(isGap) : [],
+    ...parseBaseline(record.baseline, record.baselineComplete),
   }
 }
 
@@ -408,6 +409,26 @@ function parseFiles(value: unknown): Record<string, FileAttribution> {
     }
   }
   return files
+}
+
+function parseBaseline(
+  value: unknown,
+  complete: unknown,
+): { baseline: Readonly<Record<string, BaselineEntry>>; baselineComplete: boolean } | Record<string, never> {
+  if (value === undefined) return {}
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  const baseline: Record<string, BaselineEntry> = {}
+  for (const [path, entry] of Object.entries(value)) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const item = entry as Partial<BaselineEntry>
+    if (typeof item.hash !== 'string' || item.hash === '') continue
+    baseline[path] = {
+      hash: item.hash,
+      mode: typeof item.mode === 'number' ? item.mode : 0o644,
+      bytes: typeof item.bytes === 'number' ? item.bytes : 0,
+    }
+  }
+  return { baseline, baselineComplete: complete === true }
 }
 
 function isGap(value: unknown): value is TurnRecord['gaps'][number] {
@@ -441,6 +462,7 @@ function collectHashes(record: TurnRecord, into: Set<string>): void {
     if (file.before !== null) into.add(file.before)
     if (file.after !== null) into.add(file.after)
   }
+  for (const entry of Object.values(record.baseline ?? {})) into.add(entry.hash)
 }
 
 function estimatedBytes(records: readonly TurnRecord[]): number {
@@ -455,6 +477,12 @@ function estimatedBytes(records: readonly TurnRecord[]): number {
       if (file.after !== null && !hashes.has(file.after)) {
         hashes.add(file.after)
         bytes += file.afterSize
+      }
+    }
+    for (const entry of Object.values(record.baseline ?? {})) {
+      if (!hashes.has(entry.hash)) {
+        hashes.add(entry.hash)
+        bytes += entry.bytes
       }
     }
   }

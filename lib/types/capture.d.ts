@@ -48,5 +48,22 @@ export declare function readCandidate(workspace: string, requested: string, conf
     readonly relativePath: string;
     readonly reason: GapReason;
 }>;
+/** Eligible files found by a turn-start walk. `complete` is false when the walk stopped early. */
+export interface WorkspaceScan {
+    readonly files: readonly {
+        readonly relativePath: string;
+        readonly captured: CapturedBytes;
+    }[];
+    readonly complete: boolean;
+}
+/**
+ * Read regular files inside a workspace for a turn-start snapshot.
+ * Generated directories, excluded globs, symlinks, hard links, and oversized files are skipped.
+ * A skipped path is not a deletion candidate.
+ * @param workspace - Canonical workspace root.
+ * @param config - Size, exclusion, and snapshot limits.
+ * @returns Captured files and whether every eligible file fit in the cap.
+ */
+export declare function scanWorkspace(workspace: string, config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs' | 'maxSnapshotFiles'>): Promise<WorkspaceScan>;
 /** Canonicalize a directory, or return it unchanged when it does not exist yet. */
 export declare function canonicalDir(path: string): Promise<string>;

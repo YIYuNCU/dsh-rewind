@@ -16,4 +16,11 @@ declare module '@deepseek-ai/dsh-client-ui-primitives' {
     size?: 'md' | 'sm'
     icon?: ReactNode
   } & ButtonHTMLAttributes<HTMLButtonElement>>
+  export const Switch: ComponentType<{
+    checked: boolean
+    onChange: (next: boolean) => void
+    label: string
+    disabled?: boolean
+    title?: string
+  }>
 }

@@ -39,6 +39,13 @@ export interface RewindConfig {
   readonly excludeGlobs?: string
   /** Also skip `node_modules`, `.git`, `dist`, `coverage`, and `.dsh`. */
   readonly skipGenerated?: boolean
+  /**
+   * Snapshot eligible files at each turn start.
+   * Rewinding that turn then undoes later manual edits and script edits.
+   */
+  readonly captureExternal?: boolean
+  /** Most files stored in one turn-start snapshot. A partial snapshot never deletes unseen files. */
+  readonly maxSnapshotFiles?: number
   /** Largest regular file whose bytes are stored. */
   readonly maxFileBytes?: number
   /** Newest checkpoints kept for one session after the age sweep. */
@@ -82,6 +89,8 @@ export interface ResolvedRewindConfig {
   readonly pathFields: readonly string[]
   readonly excludeGlobs: readonly string[]
   readonly skipGenerated: boolean
+  readonly captureExternal: boolean
+  readonly maxSnapshotFiles: number
   readonly maxFileBytes: number
   readonly maxCheckpointsPerSession: number
   readonly retentionDays: number
@@ -117,6 +126,13 @@ export interface CaptureGap {
   readonly reason: GapReason
 }
 
+/** One file in the workspace snapshot taken when a turn started. */
+export interface BaselineEntry {
+  readonly hash: string
+  readonly mode: number
+  readonly bytes: number
+}
+
 /** Durable per-turn attribution. A later line for the same turn replaces the earlier one. */
 export interface TurnRecord {
   readonly version: typeof REWIND_FORMAT_VERSION
@@ -130,6 +146,10 @@ export interface TurnRecord {
   readonly shellGap: boolean
   readonly files: Readonly<Record<string, FileAttribution>>
   readonly gaps: readonly CaptureGap[]
+  /** Workspace contents when this turn started. Absent on records written before external capture. */
+  readonly baseline?: Readonly<Record<string, BaselineEntry>>
+  /** False when the snapshot stopped early. Incomplete snapshots do not delete unseen files. */
+  readonly baselineComplete?: boolean
 }
 
 /** Write or delete when the recorded before-image is applied. */

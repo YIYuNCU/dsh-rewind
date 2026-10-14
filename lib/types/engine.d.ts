@@ -1,8 +1,9 @@
 import { retainTurns } from './ledger.js';
 import type { FileRestoreResult, ResolvedRewindConfig, RewindConfig, RewindPreview, SessionUsage } from './types.js';
 /**
- * File-attribution ledger.
- * It stores the before-image of file tools only, and it never writes into the user's Git repository.
+ * File-attribution ledger plus a turn-start workspace snapshot.
+ * The snapshot is what makes manual edits and script edits between turns restorable.
+ * Bytes stay outside the user's Git repository.
  */
 export declare class RewindEngine {
     private current;
@@ -10,6 +11,10 @@ export declare class RewindEngine {
     private readonly open;
     private readonly pending;
     private readonly chains;
+    /** In-flight `beginTurn`, so a tool cannot read a file before its snapshot exists. */
+    private readonly turnOpenings;
+    /** Serializes before-image reads of one path. The caller may write only after this resolves. */
+    private readonly pathChains;
     /**
      * @param config - Plugin config. The storage root is fixed after construction.
      */
@@ -35,6 +40,7 @@ export declare class RewindEngine {
         readonly turn: number;
         readonly turnStartSeq: number;
     }): Promise<void>;
+    private openTurn;
     /**
      * Attach the opening user message to the current turn.
      * @param sessionId - Session that owns the message.
@@ -115,6 +121,7 @@ export declare class RewindEngine {
     private currentBytes;
     private restoreTarget;
     private rollbackJournal;
+    private exclusivePath;
     private exclusive;
 }
 export { retainTurns };

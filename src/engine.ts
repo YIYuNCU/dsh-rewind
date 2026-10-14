@@ -1,12 +1,13 @@
 import { createHash } from 'node:crypto'
 import { lstat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
-import { canonicalDir, classifyTool, isGeneratedPath, matchesGlob, readCandidate, type CapturedBytes } from './capture.js'
+import { canonicalDir, classifyTool, isGeneratedPath, matchesGlob, readCandidate, scanWorkspace, type CapturedBytes } from './capture.js'
 import { RewindError } from './errors.js'
 import { Ledger, retainTurns, type JournalStep, type RestoreJournal } from './ledger.js'
 import { isNodeError, isWithin, pruneEmptyParents, removeFile, replaceRegularFile, resolveContainedPath } from './paths.js'
 import { resolveConfig } from './config.js'
 import type {
+  BaselineEntry,
   CaptureGap,
   FileAttribution,
   FileRestoreResult,
@@ -31,6 +32,9 @@ interface OpenTurn {
   gaps: CaptureGap[]
   inflight: Set<string>
   earlyAfter: Map<string, CapturedBytes>
+  /** Undefined when external capture is off. An empty map is a real snapshot of an empty tree. */
+  baseline?: Record<string, BaselineEntry>
+  baselineComplete: boolean
 }
 
 interface PendingCapture {
@@ -42,8 +46,9 @@ interface PendingCapture {
 }
 
 /**
- * File-attribution ledger.
- * It stores the before-image of file tools only, and it never writes into the user's Git repository.
+ * File-attribution ledger plus a turn-start workspace snapshot.
+ * The snapshot is what makes manual edits and script edits between turns restorable.
+ * Bytes stay outside the user's Git repository.
  */
 export class RewindEngine {
   private current: ResolvedRewindConfig
@@ -51,6 +56,10 @@ export class RewindEngine {
   private readonly open = new Map<string, OpenTurn>()
   private readonly pending = new Map<string, PendingCapture>()
   private readonly chains = new Map<string, Promise<unknown>>()
+  /** In-flight `beginTurn`, so a tool cannot read a file before its snapshot exists. */
+  private readonly turnOpenings = new Map<string, Promise<void>>()
+  /** Serializes before-image reads of one path. The caller may write only after this resolves. */
+  private readonly pathChains = new Map<string, Promise<unknown>>()
 
   /**
    * @param config - Plugin config. The storage root is fixed after construction.
@@ -96,7 +105,21 @@ export class RewindEngine {
    * Remember the workspace turn that is about to run.
    * @param input - Identity of the turn.
    */
-  async beginTurn(input: {
+  beginTurn(input: {
+    readonly sessionId: string
+    readonly workspace: string
+    readonly turn: number
+    readonly turnStartSeq: number
+  }): Promise<void> {
+    const earlier = this.turnOpenings.get(input.sessionId) ?? Promise.resolve()
+    const run = earlier.then(() => this.openTurn(input))
+    this.turnOpenings.set(input.sessionId, run)
+    return run.finally(() => {
+      if (this.turnOpenings.get(input.sessionId) === run) this.turnOpenings.delete(input.sessionId)
+    })
+  }
+
+  private async openTurn(input: {
     readonly sessionId: string
     readonly workspace: string
     readonly turn: number
@@ -105,7 +128,7 @@ export class RewindEngine {
     const previous = this.open.get(input.sessionId)
     if (previous !== undefined && previous.turn !== input.turn) await this.flush(previous)
     const workspace = await canonicalDir(input.workspace)
-    this.open.set(input.sessionId, {
+    const open: OpenTurn = {
       sessionId: input.sessionId,
       workspace,
       turn: input.turn,
@@ -116,7 +139,26 @@ export class RewindEngine {
       gaps: [],
       inflight: new Set(),
       earlyAfter: new Map(),
-    })
+      baselineComplete: false,
+    }
+    if (this.current.enabled && this.current.captureExternal) {
+      const scanned = await scanWorkspace(workspace, this.current)
+      const baseline: Record<string, BaselineEntry> = {}
+      let complete = scanned.complete
+      for (const file of scanned.files) {
+        try {
+          await this.storeCaptured(file.captured)
+        } catch {
+          complete = false
+          continue
+        }
+        if (file.captured.hash === null) continue
+        baseline[file.relativePath] = { hash: file.captured.hash, mode: file.captured.mode, bytes: file.captured.size }
+      }
+      open.baseline = baseline
+      open.baselineComplete = complete
+    }
+    this.open.set(input.sessionId, open)
   }
 
   /**
@@ -126,6 +168,8 @@ export class RewindEngine {
    * @param userMessageSeq - Event sequence of the direct user message.
    */
   async noteUserMessage(sessionId: string, turn: number, userMessageSeq: number): Promise<void> {
+    const opening = this.turnOpenings.get(sessionId)
+    if (opening !== undefined) await opening
     const current = this.open.get(sessionId)
     if (current === undefined || current.turn !== turn || current.userMessageSeq !== undefined) return
     current.userMessageSeq = userMessageSeq
@@ -149,6 +193,8 @@ export class RewindEngine {
     if (!config.enabled) return
     const sessionId = this.attributionSession(input.sessionId, input.parentSessionId, input.subagent)
     if (sessionId === undefined) return
+    const opening = this.turnOpenings.get(sessionId)
+    if (opening !== undefined) await opening
     const open = this.open.get(sessionId)
     if (open === undefined) return
     if (overlapsStorage(open.workspace, config.storageDir)) {
@@ -157,43 +203,45 @@ export class RewindEngine {
     }
     const classified = classifyTool(input.toolName, input.args, config)
     if (classified.kind !== 'file') return
-    if (open.inflight.has(classified.path)) {
-      this.pending.set(pendingKey(sessionId, input.callId), { sessionId, turn: open.turn, path: classified.path, mode: 'update' })
-      return
-    }
-    open.inflight.add(classified.path)
-    let resolved: Awaited<ReturnType<typeof readCandidate>>
-    try {
-      resolved = await readCandidate(open.workspace, classified.path, config)
-    } catch {
-      open.inflight.delete(classified.path)
-      this.addGap(open, classified.path, 'capture-failed')
-      return
-    }
-    if ('reason' in resolved) {
-      open.inflight.delete(classified.path)
-      this.addGap(open, resolved.relativePath, resolved.reason)
-      await this.flush(open)
-      return
-    }
-    if ((config.skipGenerated && isGeneratedPath(resolved.relativePath)) || matchesGlob(resolved.relativePath, config.excludeGlobs)) {
-      open.inflight.delete(classified.path)
-      return
-    }
-    const path = resolved.relativePath
-    if (path !== classified.path) open.inflight.delete(classified.path)
-    if (open.files[path] !== undefined || (path !== classified.path && open.inflight.has(path))) {
-      open.inflight.delete(path === classified.path ? path : classified.path)
-      this.pending.set(pendingKey(sessionId, input.callId), { sessionId, turn: open.turn, path, mode: 'update' })
-      return
-    }
-    open.inflight.add(path)
-    this.pending.set(pendingKey(sessionId, input.callId), {
-      sessionId,
-      turn: open.turn,
-      path,
-      mode: 'create',
-      captured: resolved.captured,
+    await this.exclusivePath(`${sessionId}\0${classified.path}`, async () => {
+      if (open.inflight.has(classified.path)) {
+        this.pending.set(pendingKey(sessionId, input.callId), { sessionId, turn: open.turn, path: classified.path, mode: 'update' })
+        return
+      }
+      open.inflight.add(classified.path)
+      let resolved: Awaited<ReturnType<typeof readCandidate>>
+      try {
+        resolved = await readCandidate(open.workspace, classified.path, config)
+      } catch {
+        open.inflight.delete(classified.path)
+        this.addGap(open, classified.path, 'capture-failed')
+        return
+      }
+      if ('reason' in resolved) {
+        open.inflight.delete(classified.path)
+        this.addGap(open, resolved.relativePath, resolved.reason)
+        await this.flush(open)
+        return
+      }
+      if ((config.skipGenerated && isGeneratedPath(resolved.relativePath)) || matchesGlob(resolved.relativePath, config.excludeGlobs)) {
+        open.inflight.delete(classified.path)
+        return
+      }
+      const path = resolved.relativePath
+      if (path !== classified.path) open.inflight.delete(classified.path)
+      if (open.files[path] !== undefined || (path !== classified.path && open.inflight.has(path))) {
+        open.inflight.delete(path === classified.path ? path : classified.path)
+        this.pending.set(pendingKey(sessionId, input.callId), { sessionId, turn: open.turn, path, mode: 'update' })
+        return
+      }
+      open.inflight.add(path)
+      this.pending.set(pendingKey(sessionId, input.callId), {
+        sessionId,
+        turn: open.turn,
+        path,
+        mode: 'create',
+        captured: resolved.captured,
+      })
     })
   }
 
@@ -211,6 +259,8 @@ export class RewindEngine {
   }): Promise<void> {
     const config = this.current
     const sessionId = this.attributionSession(input.sessionId, input.parentSessionId, input.subagent) ?? input.sessionId
+    const opening = this.turnOpenings.get(sessionId)
+    if (opening !== undefined) await opening
     const open = this.open.get(sessionId)
     const classified = classifyTool(input.toolName, {}, { ...config, extraFileTools: [] })
     if (classified.kind === 'shell') {
@@ -411,7 +461,8 @@ export class RewindEngine {
 
   private async flush(open: OpenTurn): Promise<void> {
     if (open.userMessageSeq === undefined) return
-    if (Object.keys(open.files).length === 0 && open.gaps.length === 0 && !open.shellGap) return
+    const snapshotted = open.baseline !== undefined
+    if (!snapshotted && Object.keys(open.files).length === 0 && open.gaps.length === 0 && !open.shellGap) return
     const record: TurnRecord = {
       version: 1,
       sessionId: open.sessionId,
@@ -424,15 +475,31 @@ export class RewindEngine {
       shellGap: open.shellGap,
       files: open.files,
       gaps: open.gaps,
+      ...(open.baseline === undefined ? {} : { baseline: open.baseline, baselineComplete: open.baselineComplete }),
     }
     await this.ledger.appendTurn(record)
   }
 
   private async describe(workspace: string, turns: readonly TurnRecord[], config: ResolvedRewindConfig): Promise<PreviewFile[]> {
     const reduced = reduceTurns(turns)
+    const target = earliestTurn(turns)
+    if (target?.baseline !== undefined) {
+      for (const [path, entry] of Object.entries(target.baseline)) {
+        reduced.set(path, { file: baselineAttribution(entry), checkpoint: true })
+      }
+      if (target.baselineComplete && config.enabled && config.captureExternal) {
+        const live = await scanWorkspace(workspace, config)
+        for (const file of live.files) {
+          if (reduced.has(file.relativePath)) continue
+          reduced.set(file.relativePath, { file: createdAttribution(file.captured.mode), checkpoint: true })
+        }
+      }
+    }
     const files: PreviewFile[] = []
     for (const [path, entry] of [...reduced.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-      files.push(await this.describePath(workspace, path, entry, config))
+      const described = await this.describePath(workspace, path, entry, config)
+      if (entry.checkpoint === true && described.action === 'unchanged') continue
+      files.push(described)
     }
     return files
   }
@@ -443,6 +510,17 @@ export class RewindEngine {
     entry: ReducedPath,
     config: ResolvedRewindConfig,
   ): Promise<PreviewFile> {
+    if (entry.checkpoint === true && entry.file !== undefined) {
+      const file = entry.file
+      if (file.before === null && !config.restoreCreatedFiles) {
+        return { path, action: 'delete', state: 'gap', reason: 'unsupported', before: null, current: null, bytes: 0, mode: file.mode }
+      }
+      const current = await this.currentBytes(workspace, path, file, config)
+      const action: RestoreAction = file.before === null
+        ? (current.hash === null ? 'unchanged' : 'delete')
+        : (current.hash === file.before ? 'unchanged' : 'restore')
+      return { path, action, state: 'clean', before: file.before, current: current.hash, bytes: file.beforeBytes, mode: file.mode }
+    }
     if (entry.gap !== undefined && entry.file === undefined) {
       return { path, action: 'unchanged', state: 'gap', reason: entry.gap, before: null, current: null, bytes: 0, mode: 0o644 }
     }
@@ -534,6 +612,21 @@ export class RewindEngine {
     await this.ledger.deleteJournal(workspace)
   }
 
+  private async exclusivePath(key: string, task: () => Promise<void>): Promise<void> {
+    const previous = this.pathChains.get(key) ?? Promise.resolve()
+    let release = (): void => {}
+    const gate = new Promise<void>(resolveGate => { release = resolveGate })
+    const tail = previous.then(() => gate)
+    this.pathChains.set(key, tail)
+    await previous.catch(() => undefined)
+    try {
+      await task()
+    } finally {
+      release()
+      if (this.pathChains.get(key) === tail) this.pathChains.delete(key)
+    }
+  }
+
   private async exclusive<T>(workspace: string, task: () => Promise<T>): Promise<T> {
     const previous = this.chains.get(workspace) ?? Promise.resolve()
     let release = (): void => {}
@@ -554,6 +647,8 @@ export class RewindEngine {
 interface ReducedPath {
   readonly file?: FileAttribution
   readonly gap?: CaptureGap['reason']
+  /** Turn-start snapshot, not a file-tool conflict. */
+  checkpoint?: boolean
 }
 
 function reduceTurns(turns: readonly TurnRecord[]): Map<string, ReducedPath> {
@@ -573,6 +668,21 @@ function reduceTurns(turns: readonly TurnRecord[]): Map<string, ReducedPath> {
     }
   }
   return paths
+}
+
+function earliestTurn(turns: readonly TurnRecord[]): TurnRecord | undefined {
+  return turns.reduce<TurnRecord | undefined>((best, record) => {
+    if (best === undefined || record.turn < best.turn) return record
+    return best
+  }, undefined)
+}
+
+function baselineAttribution(entry: BaselineEntry): FileAttribution {
+  return { before: entry.hash, after: null, mode: entry.mode, beforeBytes: entry.bytes, afterSize: 0, afterMtimeMs: 0 }
+}
+
+function createdAttribution(mode: number): FileAttribution {
+  return { before: null, after: null, mode, beforeBytes: 0, afterSize: 0, afterMtimeMs: 0 }
 }
 
 function attribution(before: CapturedBytes, after: CapturedBytes | undefined): FileAttribution {
