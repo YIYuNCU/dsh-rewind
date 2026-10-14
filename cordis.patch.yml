@@ -1,0 +1,4 @@
+# Mount DSH Rewind into a profile. File history stays outside the worktree.
+- insert:
+    - id: dsh-rewind
+      name: dsh-rewind
