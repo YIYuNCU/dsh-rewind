@@ -115,19 +115,27 @@ export interface WorkspaceScan {
   readonly complete: boolean
 }
 
+/** One regular file the walk can see without reading its bytes. */
+export interface ListedFile {
+  readonly relativePath: string
+  readonly mode: number
+  readonly size: number
+}
+
 /**
- * Read regular files inside a workspace for a turn-start snapshot.
+ * List regular files without reading them.
  * Generated directories, excluded globs, symlinks, hard links, and oversized files are skipped.
  * A skipped path is not a deletion candidate.
  * @param workspace - Canonical workspace root.
- * @param config - Size, exclusion, and snapshot limits.
- * @returns Captured files and whether every eligible file fit in the cap.
+ * @param config - Size and exclusion rules.
+ * @param limit - Stop after this many files and mark the walk incomplete.
  */
-export async function scanWorkspace(
+export async function listEligibleFiles(
   workspace: string,
-  config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs' | 'maxSnapshotFiles'>,
-): Promise<WorkspaceScan> {
-  const files: { relativePath: string; captured: CapturedBytes }[] = []
+  config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs'>,
+  limit?: number,
+): Promise<{ readonly files: readonly ListedFile[]; readonly complete: boolean }> {
+  const files: ListedFile[] = []
   let complete = true
   const walk = async (directory: string): Promise<void> => {
     if (!complete) return
@@ -138,11 +146,9 @@ export async function scanWorkspace(
       complete = false
       return
     }
+    const pending: { absolute: string; relativePath: string }[] = []
     for (const entry of entries) {
-      if (!complete || files.length >= config.maxSnapshotFiles) {
-        complete = false
-        return
-      }
+      if (!complete) return
       const absolute = join(directory, entry.name)
       if (entry.isSymbolicLink()) continue
       if (entry.isDirectory()) {
@@ -154,17 +160,101 @@ export async function scanWorkspace(
       const relativePath = relativePosix(workspace, absolute)
       if (relativePath === undefined) continue
       if ((config.skipGenerated && isGeneratedPath(relativePath)) || matchesGlob(relativePath, config.excludeGlobs)) continue
-      const resolved = await readCandidate(workspace, absolute, { maxFileBytes: config.maxFileBytes, allowOutsideWorkspace: false }).catch(() => undefined)
-      if (resolved === undefined) {
+      pending.push({ absolute, relativePath })
+    }
+    const stats = await runPool(pending, 16, async item => {
+      try {
+        return { ...item, info: await lstat(item.absolute) }
+      } catch {
+        return undefined
+      }
+    })
+    for (const item of stats) {
+      if (!complete) return
+      if (item === undefined) {
         complete = false
         continue
       }
-      if ('reason' in resolved || resolved.captured.hash === null) continue
-      files.push({ relativePath: resolved.relativePath, captured: resolved.captured })
+      const info = item.info
+      if (!info.isFile() || info.isSymbolicLink() || info.nlink > 1 || info.size > config.maxFileBytes) continue
+      if (limit !== undefined && files.length >= limit) {
+        complete = false
+        return
+      }
+      files.push({ relativePath: item.relativePath, mode: info.mode & 0o777, size: info.size })
     }
   }
   await walk(workspace)
   return { files, complete }
+}
+
+/**
+ * Read regular files inside a workspace for a turn-start snapshot.
+ * The walk already skipped symlink parents, so each file is hashed without another parent walk.
+ * @param workspace - Canonical workspace root.
+ * @param config - Size, exclusion, and snapshot limits.
+ * @returns Captured files and whether every eligible file fit in the cap.
+ */
+export async function scanWorkspace(
+  workspace: string,
+  config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs' | 'maxSnapshotFiles'>,
+): Promise<WorkspaceScan> {
+  const listed = await listEligibleFiles(workspace, config, config.maxSnapshotFiles)
+  let dropped = false
+  const reads = await runPool(listed.files, 8, async file => {
+    const absolute = resolve(workspace, ...file.relativePath.split('/'))
+    try {
+      const captured = await readRegular(absolute, config.maxFileBytes)
+      return captured === undefined ? undefined : { relativePath: file.relativePath, captured }
+    } catch {
+      return undefined
+    }
+  })
+  const files: { relativePath: string; captured: CapturedBytes }[] = []
+  for (const item of reads) {
+    if (item === undefined) {
+      dropped = true
+      continue
+    }
+    files.push(item)
+  }
+  return { files, complete: listed.complete && !dropped }
+}
+
+/** Run `task` over `items` with a fixed number of workers. */
+export async function runPool<T, R>(items: readonly T[], limit: number, task: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = next
+      next += 1
+      if (index >= items.length) return
+      const item = items[index]
+      if (item === undefined) return
+      results[index] = await task(item)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()))
+  return results
+}
+
+async function readRegular(absolute: string, maxFileBytes: number): Promise<CapturedBytes | undefined> {
+  const handle = await open(absolute, 'r')
+  try {
+    const info = await handle.stat()
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink > 1 || info.size > maxFileBytes) return undefined
+    const bytes = await handle.readFile()
+    return {
+      hash: createHash('sha256').update(bytes).digest('hex'),
+      bytes,
+      mode: info.mode & 0o777,
+      size: bytes.length,
+      mtimeMs: info.mtimeMs,
+    }
+  } finally {
+    await handle.close()
+  }
 }
 
 /** Canonicalize a directory, or return it unchanged when it does not exist yet. */

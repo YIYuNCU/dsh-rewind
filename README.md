@@ -1,49 +1,96 @@
 # dsh-rewind
 
-DSH 的按轮回退插件。每轮开始时记下工作区里符合条件的文件，放在工作区外面；对话回退会另开一个会话，不截断原来的记录。
+[![GitHub](https://img.shields.io/badge/GitHub-YIYuNCU%2Fdsh-rewind-181717?logo=github)](https://github.com/YIYuNCU/dsh-rewind)
 
-不把快照写进用户仓库的 Git 对象。回退到某一轮，会把之后的手改、脚本改动和文件工具改动撤回到那一轮开始时。生成目录、符号链接、硬链接，以及超过大小或数量上限的文件不会动。
+**DeepSeek Harness 的按轮回退插件。** 把文件改回某一轮开始时的内容，并另开会话。原来的会话记录保持不变。
+
+- 每一轮开始时，记下工作区里符合条件的文件。快照放在工作区外面，不写进仓库的 Git 对象。
+- 回退会撤掉这一轮之后的文件工具改动，以及两轮之间的手改和脚本改动。
+- 回退对话时另开一个会话，不截断原来的记录。
+
+界面语言为简体中文和 English。
 
 ## 安装
 
-这是一个 DSH Profile Bundle：`package.json` 声明 `dsh.bundle.patch`，`cordis.patch.yml` 插入 `dsh-rewind`。安装消费已经构建好的 `lib/`，不要改 DSH 主仓库，也不要重新构建 Web 壳。客户端从包的 `./client` 入口加载。
+这是一个 DSH Profile Bundle。安装使用仓库里已经构建好的 `lib/`，不需要在本机再构建。
 
-命令行 profile 用 `dsh plugin`，它和界面里的插件管理走同一套 pnpm 事务。本地目录可以是相对路径或绝对路径：
+### 网页或桌面端
 
-```sh
-dsh plugin --profile web add G:\Code\DSH\dsh-rewind
-dsh --profile web --dump-config
+在 **添加插件** 的输入框填：
+
+```text
+github:YIYuNCU/dsh-rewind
 ```
 
-`desktop` 这个名字由 Electron 独占，`dsh plugin --profile desktop` 会被拒绝。在正在运行的桌面端里，打开插件页，把绝对路径交给安装框。不要手改 `$DSH_HOME/profiles/desktop/package.json`。新组合包会进入 `dsh.profile.bundles`。链接到配置目录外的检出要等进程重新建立解析表之后才能导入 peer；第一次启用若报 `failed to import`，完全退出并重新打开桌面端，再启用一次。已经装过的同一依赖被替换时同样需要重启进程。
+`desktop` 这个 profile 由桌面端独占，不要运行 `dsh plugin --profile desktop`，也不要手改 profile 的 `package.json`。第一次启用如果提示无法导入，完全退出并重新打开客户端，再启用一次。
 
-存储默认在 `$DSH_HOME/rewind/v1`，没有该变量时用 `~/.dsh/rewind/v1`。`storageDir` 只写在配置层，运行中不能改。
+### 命令行
+
+网页 profile：
+
+```sh
+dsh plugin --profile web add github:YIYuNCU/dsh-rewind
+```
+
+本地检出可以用相对路径或绝对路径：
+
+```sh
+dsh plugin --profile web add ./dsh-rewind
+```
+
+## 使用
+
+每个用户回合末尾有 **回退这一轮**。打开后可以选择：
+
+| 操作 | 结果 |
+| --- | --- |
+| 回退代码和对话 | 恢复文件，并另开一个会话 |
+| 只回退代码 | 只恢复文件，当前会话不动 |
+| 只回退对话 | 只另开会话，文件保持现状 |
+
+没有可回退的文件时，仍然可以只回退对话。文件恢复失败时不会另开会话。同一工作区还有代理在跑时，默认不允许改文件。
+
+设置在插件详情页，不在客户端的设置面板里。改完立即生效。
 
 ## 设置
 
-插件详情页（插件列表里打开 `dsh-rewind`）显示这些项，改完立刻作用到正在运行的引擎上。设置面板里不再有这一页。
-
-| 项 | 默认 | 作用 |
+| 设置 | 默认 | 说明 |
 | --- | --- | --- |
-| `skipGenerated` | 开 | 跳过 `node_modules`、`.git`、`dist`、`coverage`、`.dsh` |
-| `captureExternal` | 开 | 每轮开始时记下工作区。两轮之间的手改和脚本改动，回退到较早的一轮时撤掉 |
-| `captureSubagents` | 开 | 子代理的文件工具算到父会话当前轮 |
-| `shellPolicy` | `gap` | `gap` 标明跑过命令；`ignore` 不标明。命令本身不另做快照，文件仍回到回合开始时的内容 |
-| `conflictPolicy` | `ask` | `ask` 需勾选，`skip` 跳过，`overwrite` 覆盖 |
-| `restoreCreatedFiles` | 开 | 回退时删除这一轮新建的文件 |
-| `putPromptInComposer` | 开 | 回退对话后把原话放回新会话输入框 |
-| `blockWhileAgentsRun` | 开 | 同一工作区还有代理在跑时不允许改文件 |
-| `retentionDays` | 30 | `0` 表示不按天数删除 |
-| `maxStorageBytes` | 2 GiB | 全部会话加在一起的字节上限，至少保留一轮。页面按 MiB 填写 |
-| `maxStoredTurns` | 1000 | 全部会话加在一起保留的轮数 |
+| 跳过生成目录 | 开 | 不记录 `node_modules`、`.git`、`dist`、`coverage`、`.dsh` |
+| 记录回合之间的改动 | 开 | 每轮开始时记下工作区。之后的手改和脚本改动，回退到这一轮时撤掉 |
+| 记录子代理 | 开 | 子代理改的文件算到父会话当前这一轮 |
+| 命令工具 | 标明跑过命令 | 只标明这一轮跑过命令，不给命令做快照。合格文件仍回到这一轮开始时的内容。另一项是「不标明」 |
+| 文件冲突 | 询问 | 文件已经和记录不一致时：询问、跳过，或覆盖 |
+| 删除本轮新建的文件 | 开 | 关闭后，这一轮新建的文件留在原地 |
+| 把原话放回输入框 | 开 | 回退对话后，把当时的用户消息放进新会话的输入框 |
+| 运行中禁止改文件 | 开 | 同一工作区还有代理在跑时，不允许回退代码 |
+| 保留天数 | 30 | `0` 表示不按天数删除 |
+| 最大存储空间 | 2048 MiB | 全部会话加在一起的上限。超出后丢掉最旧的一轮，至少保留一轮 |
+| 最大存储轮数 | 1000 | 全部会话加在一起最多保留这么多轮 |
 
-同一命名空间里还有这些项，页面不显示，默认值继续生效，只能在配置层改：`enabled`、`shellTools`、`extraFileTools`、`pathFields`、`excludeGlobs`、`maxFileBytes`、`maxSnapshotFiles`（默认 2000，扫满后不再删除没扫到的文件）、`maxCheckpointsPerSession`、`maxSessionBytes`、`allowOutsideWorkspace`、`previewTrust`、`maxPreviewFiles`、`staleLockMs`、`originCheck`、`storageDir`。
+生成目录、符号链接、硬链接，以及超过大小或数量上限的文件，不会自动撤掉。单个文件默认不超过 8 MiB，一轮默认最多记录 2000 个文件。
+
+存储默认在 `$DSH_HOME/rewind/v1`。没有该变量时用 `~/.dsh/rewind/v1`。存储目录只能在配置层修改，运行中不能改。
+
+## 兼容
+
+`package.json` 声明的 DeepSeek Harness 版本：
+
+```text
+>=0.1.0-rc.8 <0.2.0 || ^0.1.7-rc.1 || 0.2.0-rc.2
+```
+
+Node.js：`^22.19.0 || >=24`。
 
 ## 开发
 
-```bash
+```sh
 pnpm install
 pnpm test
 ```
 
-测试覆盖文件工具的修改前记录、失败工具不记账、命令缺口、冲突、新建文件、排除路径、符号链接父目录、保留策略、两轮之间的手改和脚本改动，以及中断回退后的启动补偿。
+`pnpm test` 会先构建 `lib/`，再运行测试。测试覆盖修改前记录、失败工具、命令缺口、冲突、新建文件、排除路径、符号链接、保留上限、回合之间的手改，以及中断回退后的启动补偿。
+
+## 许可证
+
+[BSD-3-Clause](LICENSE)

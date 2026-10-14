@@ -18,10 +18,16 @@ export interface JournalStep {
 }
 /**
  * Content-addressed blobs and per-session turn logs.
- * Blobs are written once. A later turn line for the same turn replaces earlier lines on read.
+ * Blobs are written once. A later full line for the same turn replaces earlier lines.
+ * A line with `patch: true` merges into that turn instead, so one file capture does not rewrite the whole snapshot.
  */
 export declare class Ledger {
     private config;
+    private readonly turnCache;
+    private sessionsLoaded;
+    private readonly knownSessions;
+    private readonly blobShards;
+    private readonly journalLengths;
     /**
      * @param config - Resolved config. Only `storageDir` and retention fields are read.
      */
@@ -30,11 +36,14 @@ export declare class Ledger {
     replaceConfig(config: ResolvedRewindConfig): void;
     /** Create the state root. */
     initialize(): Promise<void>;
-    /** Store bytes and return their SHA-256. Existing contents are verified. */
-    putBlob(bytes: Buffer): Promise<string>;
+    /**
+     * Store bytes and return their SHA-256.
+     * Existing contents are verified. `hash` skips a second digest when the caller already hashed the same bytes.
+     */
+    putBlob(bytes: Buffer, hash?: string): Promise<string>;
     /** Read a blob and reject a hash mismatch. */
     readBlob(hash: string): Promise<Buffer>;
-    /** Append one full turn snapshot, then apply retention. */
+    /** Append one full turn snapshot, or a same-turn patch, then apply retention. */
     appendTurn(record: TurnRecord): Promise<void>;
     /** Collapsed turn records, oldest first. */
     readTurns(sessionId: string): Promise<TurnRecord[]>;
@@ -46,11 +55,18 @@ export declare class Ledger {
      */
     enforceGlobalLimits(): Promise<void>;
     private writeTurns;
+    private cachedTurns;
+    /** Load sibling sessions once, then decide the global cap from memory. */
+    private exceedsGlobalCap;
+    private ensureSessionsLoaded;
     /** Disk use of every session log. */
     usage(): Promise<SessionUsage[]>;
     /** Delete one session log, or every session log, then unreferenced blobs. */
     purge(sessionId?: string): Promise<number>;
-    /** Persist a restore journal before the first mutation. */
+    /**
+     * Persist a restore journal before the first mutation.
+     * Each call appends only the new or updated step. An older `journal.json` is still readable.
+     */
     writeJournal(workspace: string, journal: RestoreJournal): Promise<void>;
     /** Read the journal for one workspace, if a restore was interrupted. */
     readJournal(workspace: string): Promise<RestoreJournal | undefined>;

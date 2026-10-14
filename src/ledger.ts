@@ -32,9 +32,16 @@ interface LockRecord {
 
 /**
  * Content-addressed blobs and per-session turn logs.
- * Blobs are written once. A later turn line for the same turn replaces earlier lines on read.
+ * Blobs are written once. A later full line for the same turn replaces earlier lines.
+ * A line with `patch: true` merges into that turn instead, so one file capture does not rewrite the whole snapshot.
  */
 export class Ledger {
+  private readonly turnCache = new Map<string, TurnRecord[]>()
+  private sessionsLoaded = false
+  private readonly knownSessions = new Set<string>()
+  private readonly blobShards = new Set<string>()
+  private readonly journalLengths = new Map<string, number>()
+
   /**
    * @param config - Resolved config. Only `storageDir` and retention fields are read.
    */
@@ -51,11 +58,18 @@ export class Ledger {
     await mkdir(this.blobRoot(), { recursive: true, mode: 0o700 })
   }
 
-  /** Store bytes and return their SHA-256. Existing contents are verified. */
-  async putBlob(bytes: Buffer): Promise<string> {
-    const hash = createHash('sha256').update(bytes).digest('hex')
+  /**
+   * Store bytes and return their SHA-256.
+   * Existing contents are verified. `hash` skips a second digest when the caller already hashed the same bytes.
+   */
+  async putBlob(bytes: Buffer, hash = createHash('sha256').update(bytes).digest('hex')): Promise<string> {
+    assertHash(hash)
     const path = this.blobPath(hash)
-    await mkdir(join(this.blobRoot(), hash.slice(0, 2)), { recursive: true, mode: 0o700 })
+    const shard = hash.slice(0, 2)
+    if (!this.blobShards.has(shard)) {
+      await mkdir(join(this.blobRoot(), shard), { recursive: true, mode: 0o700 })
+      this.blobShards.add(shard)
+    }
     try {
       const handle = await open(path, 'wx', 0o600)
       try {
@@ -82,23 +96,35 @@ export class Ledger {
     return bytes
   }
 
-  /** Append one full turn snapshot, then apply retention. */
+  /** Append one full turn snapshot, or a same-turn patch, then apply retention. */
   async appendTurn(record: TurnRecord): Promise<void> {
     const directory = this.sessionDir(record.sessionId)
     await mkdir(directory, { recursive: true, mode: 0o700 })
-    await writeFile(join(directory, 'session-id'), record.sessionId, { encoding: 'utf8', mode: 0o600 })
-    await appendLine(join(directory, 'turns.jsonl'), `${JSON.stringify(record)}\n`)
-    const kept = retainTurns(await this.readTurns(record.sessionId), this.config, Date.now())
-    if (kept.length !== collapseTurns(await readLines(join(directory, 'turns.jsonl'))).length) {
-      await this.rewriteTurns(record.sessionId, kept)
+    if (!this.knownSessions.has(record.sessionId)) {
+      await writeFile(join(directory, 'session-id'), record.sessionId, { encoding: 'utf8', mode: 0o600 })
+      this.knownSessions.add(record.sessionId)
     }
-    await this.enforceGlobalLimits()
+    const turns = await this.cachedTurns(record.sessionId)
+    const index = turns.findIndex(item => item.turn === record.turn)
+    const previous = index >= 0 ? turns[index] : undefined
+    if (previous === undefined) {
+      await appendDurable(join(directory, 'turns.jsonl'), `${JSON.stringify(record)}\n`)
+      turns.push(cloneTurn(record))
+    } else {
+      const patch = patchLine(previous, record)
+      if (!isEmptyPatch(previous, patch)) {
+        await appendDurable(join(directory, 'turns.jsonl'), `${JSON.stringify(patch)}\n`)
+      }
+      turns[index] = mergeTurn(previous, record)
+    }
+    const kept = retainTurns(turns, this.config, Date.now())
+    if (kept.length !== turns.length) await this.rewriteTurns(record.sessionId, kept)
+    if (await this.exceedsGlobalCap()) await this.enforceGlobalLimits()
   }
 
   /** Collapsed turn records, oldest first. */
   async readTurns(sessionId: string): Promise<TurnRecord[]> {
-    const path = join(this.sessionDir(sessionId), 'turns.jsonl')
-    return collapseTurns(await readLines(path)).sort((left, right) => left.turn - right.turn)
+    return [...await this.cachedTurns(sessionId)].sort((left, right) => left.turn - right.turn)
   }
 
   /** Replace the session log with `records` and delete blobs nobody references. */
@@ -130,10 +156,55 @@ export class Ledger {
   }
 
   private async writeTurns(sessionId: string, records: readonly TurnRecord[]): Promise<void> {
+    const copy = records.map(cloneTurn)
+    this.turnCache.set(sessionId, copy)
     const directory = this.sessionDir(sessionId)
     await mkdir(directory, { recursive: true, mode: 0o700 })
-    const body = records.map(record => JSON.stringify(record)).join('\n')
+    const body = copy.map(record => JSON.stringify(record)).join('\n')
     await atomicWrite(join(directory, 'turns.jsonl'), body === '' ? '' : `${body}\n`)
+  }
+
+  private async cachedTurns(sessionId: string): Promise<TurnRecord[]> {
+    const existing = this.turnCache.get(sessionId)
+    if (existing !== undefined) return existing
+    const loaded = collapseTurns(await readLines(join(this.sessionDir(sessionId), 'turns.jsonl')))
+    this.turnCache.set(sessionId, loaded)
+    return loaded
+  }
+
+  /** Load sibling sessions once, then decide the global cap from memory. */
+  private async exceedsGlobalCap(): Promise<boolean> {
+    await this.ensureSessionsLoaded()
+    let count = 0
+    const records: TurnRecord[] = []
+    for (const turns of this.turnCache.values()) {
+      count += turns.length
+      records.push(...turns)
+    }
+    return count > 1 && (count > this.config.maxStoredTurns || estimatedBytes(records) > this.config.maxStorageBytes)
+  }
+
+  private async ensureSessionsLoaded(): Promise<void> {
+    if (this.sessionsLoaded) return
+    let names: string[] = []
+    try {
+      names = await readdir(this.sessionsDir())
+    } catch (error) {
+      if (!isNodeError(error, 'ENOENT')) throw error
+    }
+    for (const name of names) {
+      let sessionId: string
+      try {
+        sessionId = (await readFile(join(this.sessionsDir(), name, 'session-id'), 'utf8')).trim()
+      } catch (error) {
+        if (isNodeError(error, 'ENOENT')) continue
+        throw error
+      }
+      if (sessionId === '') continue
+      await this.cachedTurns(sessionId)
+      this.knownSessions.add(sessionId)
+    }
+    this.sessionsLoaded = true
   }
 
   /** Disk use of every session log. */
@@ -177,25 +248,51 @@ export class Ledger {
     if (sessionId === undefined) {
       const usage = await this.usage()
       for (const entry of usage) await rm(this.sessionDir(entry.sessionId), { recursive: true, force: true })
+      this.turnCache.clear()
+      this.knownSessions.clear()
+      this.sessionsLoaded = false
       await this.collectGarbage()
       return usage.length
     }
     await rm(this.sessionDir(sessionId), { recursive: true, force: true })
+    this.turnCache.delete(sessionId)
+    this.knownSessions.delete(sessionId)
     await this.collectGarbage()
     return 1
   }
 
-  /** Persist a restore journal before the first mutation. */
+  /**
+   * Persist a restore journal before the first mutation.
+   * Each call appends only the new or updated step. An older `journal.json` is still readable.
+   */
   async writeJournal(workspace: string, journal: RestoreJournal): Promise<void> {
     const directory = this.workspaceDir(workspace)
     await mkdir(directory, { recursive: true, mode: 0o700 })
-    await atomicWrite(join(directory, 'journal.json'), `${JSON.stringify(journal)}\n`)
+    const path = join(directory, 'journal.jsonl')
+    const previous = this.journalLengths.get(workspace) ?? 0
+    if (previous === 0 || journal.steps.length < previous) {
+      const body = journal.steps.map(step => JSON.stringify(journalLine(journal, step))).join('\n')
+      await atomicWrite(path, body === '' ? '' : `${body}\n`)
+    } else if (journal.steps.length === previous) {
+      const last = journal.steps[journal.steps.length - 1]
+      if (last !== undefined) await appendDurable(path, `${JSON.stringify(journalLine(journal, last))}\n`)
+    } else {
+      const fresh = journal.steps.slice(previous)
+      await appendDurable(path, `${fresh.map(step => JSON.stringify(journalLine(journal, step))).join('\n')}\n`)
+    }
+    this.journalLengths.set(workspace, journal.steps.length)
   }
 
   /** Read the journal for one workspace, if a restore was interrupted. */
   async readJournal(workspace: string): Promise<RestoreJournal | undefined> {
+    const directory = this.workspaceDir(workspace)
     try {
-      return parseJournal(JSON.parse(await readFile(join(this.workspaceDir(workspace), 'journal.json'), 'utf8')) as unknown)
+      return foldJournal(await readFile(join(directory, 'journal.jsonl'), 'utf8'))
+    } catch (error) {
+      if (!isNodeError(error, 'ENOENT')) throw error
+    }
+    try {
+      return parseJournal(JSON.parse(await readFile(join(directory, 'journal.json'), 'utf8')) as unknown)
     } catch (error) {
       if (isNodeError(error, 'ENOENT')) return undefined
       throw error
@@ -204,7 +301,10 @@ export class Ledger {
 
   /** Forget a finished journal. */
   async deleteJournal(workspace: string): Promise<void> {
-    await rm(join(this.workspaceDir(workspace), 'journal.json'), { force: true })
+    this.journalLengths.delete(workspace)
+    const directory = this.workspaceDir(workspace)
+    await rm(join(directory, 'journal.json'), { force: true })
+    await rm(join(directory, 'journal.jsonl'), { force: true })
   }
 
   /** Every workspace directory that still has a journal. */
@@ -219,8 +319,16 @@ export class Ledger {
     }
     const workspaces: string[] = []
     for (const name of names) {
+      const directory = join(root, name)
       try {
-        const journal = parseJournal(JSON.parse(await readFile(join(root, name, 'journal.json'), 'utf8')) as unknown)
+        const journal = foldJournal(await readFile(join(directory, 'journal.jsonl'), 'utf8'))
+        if (journal !== undefined) workspaces.push(journal.workspace)
+        continue
+      } catch (error) {
+        if (!isNodeError(error, 'ENOENT')) throw error
+      }
+      try {
+        const journal = parseJournal(JSON.parse(await readFile(join(directory, 'journal.json'), 'utf8')) as unknown)
         workspaces.push(journal.workspace)
       } catch (error) {
         if (isNodeError(error, 'ENOENT')) continue
@@ -362,10 +470,200 @@ function collapseTurns(lines: readonly string[]): TurnRecord[] {
   const byTurn = new Map<number, TurnRecord>()
   for (const line of lines) {
     if (line.trim() === '') continue
-    const record = parseTurn(JSON.parse(line) as unknown)
-    byTurn.set(record.turn, record)
+    const raw = JSON.parse(line) as { patch?: unknown; baseline?: unknown }
+    const record = parseTurn(raw)
+    const previous = byTurn.get(record.turn)
+    if (raw.patch === true && previous !== undefined) byTurn.set(record.turn, mergeParsed(previous, record, raw))
+    else byTurn.set(record.turn, record)
   }
   return [...byTurn.values()]
+}
+
+function cloneTurn(record: TurnRecord): TurnRecord {
+  return {
+    version: record.version,
+    sessionId: record.sessionId,
+    workspace: record.workspace,
+    turn: record.turn,
+    turnStartSeq: record.turnStartSeq,
+    userMessageSeq: record.userMessageSeq,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    shellGap: record.shellGap,
+    files: { ...record.files },
+    gaps: [...record.gaps],
+    ...(record.baseline === undefined ? {} : { baseline: { ...record.baseline }, baselineComplete: record.baselineComplete === true }),
+  }
+}
+
+interface PatchLine {
+  readonly version: typeof REWIND_FORMAT_VERSION
+  readonly sessionId: string
+  readonly workspace: string
+  readonly turn: number
+  readonly turnStartSeq: number
+  readonly userMessageSeq: number
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly shellGap: boolean
+  readonly files: Record<string, FileAttribution>
+  readonly gaps: TurnRecord['gaps'][number][]
+  readonly baseline?: Readonly<Record<string, BaselineEntry>>
+  readonly baselineComplete?: boolean
+  readonly patch: true
+}
+
+function patchLine(previous: TurnRecord, next: TurnRecord): PatchLine {
+  const files: Record<string, FileAttribution> = {}
+  for (const [path, file] of Object.entries(next.files)) {
+    const before = previous.files[path]
+    if (before === undefined || !sameFile(before, file)) files[path] = file
+  }
+  const gaps = next.gaps.filter(gap => !previous.gaps.some(item => item.path === gap.path && item.reason === gap.reason))
+  const baselineSame = sameBaseline(previous.baseline, next.baseline) && previous.baselineComplete === next.baselineComplete
+  return {
+    version: REWIND_FORMAT_VERSION,
+    sessionId: next.sessionId,
+    workspace: next.workspace,
+    turn: next.turn,
+    turnStartSeq: next.turnStartSeq,
+    userMessageSeq: next.userMessageSeq,
+    createdAt: previous.createdAt,
+    updatedAt: next.updatedAt,
+    shellGap: next.shellGap,
+    files,
+    gaps: [...gaps],
+    ...(baselineSame || next.baseline === undefined ? {} : { baseline: next.baseline, baselineComplete: next.baselineComplete === true }),
+    patch: true,
+  }
+}
+
+function isEmptyPatch(previous: TurnRecord, patch: PatchLine): boolean {
+  return Object.keys(patch.files).length === 0
+    && patch.gaps.length === 0
+    && patch.shellGap === previous.shellGap
+    && patch.baseline === undefined
+    && patch.userMessageSeq === previous.userMessageSeq
+}
+
+function mergeTurn(previous: TurnRecord, next: TurnRecord): TurnRecord {
+  return {
+    version: next.version,
+    sessionId: next.sessionId,
+    workspace: next.workspace,
+    turn: next.turn,
+    turnStartSeq: next.turnStartSeq,
+    userMessageSeq: next.userMessageSeq,
+    createdAt: previous.createdAt,
+    updatedAt: next.updatedAt,
+    shellGap: previous.shellGap || next.shellGap,
+    files: { ...previous.files, ...next.files },
+    gaps: mergeGaps(previous.gaps, next.gaps),
+    ...(next.baseline === undefined
+      ? (previous.baseline === undefined ? {} : { baseline: previous.baseline, baselineComplete: previous.baselineComplete === true })
+      : { baseline: next.baseline, baselineComplete: next.baselineComplete === true }),
+  }
+}
+
+function mergeParsed(previous: TurnRecord, patch: TurnRecord, raw: { baseline?: unknown }): TurnRecord {
+  return {
+    version: previous.version,
+    sessionId: previous.sessionId,
+    workspace: previous.workspace,
+    turn: previous.turn,
+    turnStartSeq: patch.turnStartSeq,
+    userMessageSeq: patch.userMessageSeq,
+    createdAt: previous.createdAt,
+    updatedAt: patch.updatedAt,
+    shellGap: previous.shellGap || patch.shellGap,
+    files: { ...previous.files, ...patch.files },
+    gaps: mergeGaps(previous.gaps, patch.gaps),
+    ...(raw.baseline === undefined
+      ? (previous.baseline === undefined ? {} : { baseline: previous.baseline, baselineComplete: previous.baselineComplete === true })
+      : (patch.baseline === undefined ? {} : { baseline: patch.baseline, baselineComplete: patch.baselineComplete === true })),
+  }
+}
+
+function mergeGaps(left: TurnRecord['gaps'], right: TurnRecord['gaps']): TurnRecord['gaps'][number][] {
+  const gaps = [...left]
+  for (const gap of right) {
+    if (!gaps.some(item => item.path === gap.path && item.reason === gap.reason)) gaps.push(gap)
+  }
+  return gaps
+}
+
+function sameFile(left: FileAttribution, right: FileAttribution): boolean {
+  return left.before === right.before
+    && left.after === right.after
+    && left.mode === right.mode
+    && left.beforeBytes === right.beforeBytes
+    && left.afterSize === right.afterSize
+    && left.afterMtimeMs === right.afterMtimeMs
+}
+
+function sameBaseline(
+  left: TurnRecord['baseline'],
+  right: TurnRecord['baseline'],
+): boolean {
+  if (left === right) return true
+  if (left === undefined || right === undefined) return false
+  const leftKeys = Object.keys(left)
+  if (leftKeys.length !== Object.keys(right).length) return false
+  return leftKeys.every(key => {
+    const before = left[key]
+    const after = right[key]
+    return before !== undefined && after !== undefined && before.hash === after.hash && before.mode === after.mode && before.bytes === after.bytes
+  })
+}
+
+interface JournalLine {
+  readonly version: typeof REWIND_FORMAT_VERSION
+  readonly sessionId: string
+  readonly workspace: string
+  readonly turn: number
+  readonly startedAt: number
+  readonly step: JournalStep
+}
+
+function journalLine(journal: RestoreJournal, step: JournalStep): JournalLine {
+  return {
+    version: REWIND_FORMAT_VERSION,
+    sessionId: journal.sessionId,
+    workspace: journal.workspace,
+    turn: journal.turn,
+    startedAt: journal.startedAt,
+    step,
+  }
+}
+
+function foldJournal(text: string): RestoreJournal | undefined {
+  let header: Omit<RestoreJournal, 'steps'> | undefined
+  const steps: JournalStep[] = []
+  const index = new Map<string, number>()
+  for (const line of text.split('\n')) {
+    if (line.trim() === '') continue
+    const parsed = JSON.parse(line) as Partial<JournalLine>
+    if (parsed.version !== REWIND_FORMAT_VERSION || typeof parsed.workspace !== 'string' || !isStep(parsed.step)) {
+      throw new RewindError('STATE_CORRUPT', 'restore journal is malformed')
+    }
+    header = {
+      version: REWIND_FORMAT_VERSION,
+      sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
+      workspace: parsed.workspace,
+      turn: numeric(parsed.turn),
+      startedAt: numeric(parsed.startedAt),
+    }
+    const step = parsed.step
+    const existing = index.get(step.path)
+    if (existing === undefined) {
+      index.set(step.path, steps.length)
+      steps.push(step)
+    } else {
+      steps[existing] = step
+    }
+  }
+  if (header === undefined) return undefined
+  return { ...header, steps }
 }
 
 function parseTurn(value: unknown): TurnRecord {
@@ -506,7 +804,7 @@ async function readLines(path: string): Promise<string[]> {
   }
 }
 
-async function appendLine(path: string, line: string): Promise<void> {
+async function appendDurable(path: string, line: string): Promise<void> {
   const handle = await open(path, 'a', 0o600)
   try {
     await handle.writeFile(line)

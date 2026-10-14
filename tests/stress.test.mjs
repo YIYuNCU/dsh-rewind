@@ -261,6 +261,78 @@ test('concurrent edits of one path still restore the original bytes', async () =
   assert.equal(lost, 0)
 })
 
+test('a 32 MiB file is captured and restored', async () => {
+  const bytes = 32 * 1024 * 1024
+  const fx = await fixture({
+    maxFileBytes: bytes,
+    maxStorageBytes: 128 * 1024 * 1024,
+    maxSessionBytes: 128 * 1024 * 1024,
+  })
+  try {
+    const sessionId = await openTurn(fx.engine, fx.workspace, 1)
+    const before = Buffer.alloc(bytes, 3)
+    const after = Buffer.alloc(bytes, 4)
+    const started = performance.now()
+    await changeFile(fx.engine, fx.workspace, sessionId, 'huge', 'huge.bin', before, after)
+    const captureMs = elapsed(started)
+    const previewStarted = performance.now()
+    const preview = await fx.engine.preview({ sessionId, workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
+    const previewMs = elapsed(previewStarted)
+    const restoreStarted = performance.now()
+    const restored = await fx.engine.apply({ sessionId, workspace: fx.workspace, turn: 1, fingerprint: preview.fingerprint })
+    await fx.engine.commit(fx.workspace)
+    const restoreMs = elapsed(restoreStarted)
+    const got = await readFile(join(fx.workspace, 'huge.bin'))
+    note('32 MiB capture', captureMs, `preview ${previewMs.toFixed(1)} ms ${preview.files.map(file => `${file.state}/${file.action}`).join(',') || 'none'}`)
+    note('32 MiB restore', restoreMs, `restored ${String(restored.restored.length)} skipped ${String(restored.skipped.length)} bytes ${String(got.length)}`)
+    assert.ok(captureMs < 30_000)
+    assert.ok(previewMs < 15_000)
+    assert.ok(restoreMs < 30_000)
+    assert.equal(restored.restored.length, 1)
+    assert.equal(got.compare(before), 0)
+  } finally {
+    await fx.cleanup()
+  }
+})
+
+test('a thousand files are captured, previewed, and restored', async () => {
+  const count = 1000
+  const fx = await fixture({ maxPreviewFiles: 20 })
+  try {
+    const sessionId = await openTurn(fx.engine, fx.workspace, 1)
+    const started = performance.now()
+    for (let index = 0; index < count; index += 1) {
+      const name = `many/file-${String(index).padStart(4, '0')}.txt`
+      await changeFile(
+        fx.engine, fx.workspace, sessionId, `m${String(index)}`, name,
+        `before-${String(index)}`, `after-${String(index)}`,
+      )
+    }
+    const captureMs = elapsed(started)
+    const previewStarted = performance.now()
+    const preview = await fx.engine.preview({ sessionId, workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
+    const previewMs = elapsed(previewStarted)
+    assert.equal(preview.totalFiles, count)
+    assert.equal(preview.files.length, 20)
+    assert.equal(preview.hiddenCount, count - 20)
+    const restoreStarted = performance.now()
+    const restored = await fx.engine.apply({ sessionId, workspace: fx.workspace, turn: 1, fingerprint: preview.fingerprint })
+    await fx.engine.commit(fx.workspace)
+    const restoreMs = elapsed(restoreStarted)
+    note('1000-file capture', captureMs)
+    note('1000-file preview', previewMs, `page ${String(preview.files.length)} hidden ${String(preview.hiddenCount)}`)
+    note('1000-file restore', restoreMs, `restored ${String(restored.restored.length)} skipped ${String(restored.skipped.length)}`)
+    assert.ok(captureMs < 60_000)
+    assert.ok(previewMs < 30_000)
+    assert.ok(restoreMs < 60_000)
+    assert.equal(restored.restored.length, count)
+    assert.equal(await readFile(join(fx.workspace, 'many', 'file-0000.txt'), 'utf8'), 'before-0')
+    assert.equal(await readFile(join(fx.workspace, 'many', 'file-0999.txt'), 'utf8'), 'before-999')
+  } finally {
+    await fx.cleanup()
+  }
+})
+
 test.after(() => {
   console.log(JSON.stringify(report, null, 2))
 })

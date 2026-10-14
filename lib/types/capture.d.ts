@@ -56,14 +56,33 @@ export interface WorkspaceScan {
     }[];
     readonly complete: boolean;
 }
+/** One regular file the walk can see without reading its bytes. */
+export interface ListedFile {
+    readonly relativePath: string;
+    readonly mode: number;
+    readonly size: number;
+}
 /**
- * Read regular files inside a workspace for a turn-start snapshot.
+ * List regular files without reading them.
  * Generated directories, excluded globs, symlinks, hard links, and oversized files are skipped.
  * A skipped path is not a deletion candidate.
+ * @param workspace - Canonical workspace root.
+ * @param config - Size and exclusion rules.
+ * @param limit - Stop after this many files and mark the walk incomplete.
+ */
+export declare function listEligibleFiles(workspace: string, config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs'>, limit?: number): Promise<{
+    readonly files: readonly ListedFile[];
+    readonly complete: boolean;
+}>;
+/**
+ * Read regular files inside a workspace for a turn-start snapshot.
+ * The walk already skipped symlink parents, so each file is hashed without another parent walk.
  * @param workspace - Canonical workspace root.
  * @param config - Size, exclusion, and snapshot limits.
  * @returns Captured files and whether every eligible file fit in the cap.
  */
 export declare function scanWorkspace(workspace: string, config: Pick<ResolvedRewindConfig, 'maxFileBytes' | 'skipGenerated' | 'excludeGlobs' | 'maxSnapshotFiles'>): Promise<WorkspaceScan>;
+/** Run `task` over `items` with a fixed number of workers. */
+export declare function runPool<T, R>(items: readonly T[], limit: number, task: (item: T) => Promise<R>): Promise<R[]>;
 /** Canonicalize a directory, or return it unchanged when it does not exist yet. */
 export declare function canonicalDir(path: string): Promise<string>;

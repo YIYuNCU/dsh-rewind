@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { lstat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
-import { canonicalDir, classifyTool, isGeneratedPath, matchesGlob, readCandidate, scanWorkspace, type CapturedBytes } from './capture.js'
+import { canonicalDir, classifyTool, isGeneratedPath, listEligibleFiles, matchesGlob, readCandidate, runPool, scanWorkspace, type CapturedBytes } from './capture.js'
 import { RewindError } from './errors.js'
 import { Ledger, retainTurns, type JournalStep, type RestoreJournal } from './ledger.js'
 import { isNodeError, isWithin, pruneEmptyParents, removeFile, replaceRegularFile, resolveContainedPath } from './paths.js'
@@ -145,16 +145,16 @@ export class RewindEngine {
       const scanned = await scanWorkspace(workspace, this.current)
       const baseline: Record<string, BaselineEntry> = {}
       let complete = scanned.complete
-      for (const file of scanned.files) {
+      await runPool(scanned.files, 8, async file => {
         try {
           await this.storeCaptured(file.captured)
         } catch {
           complete = false
-          continue
+          return
         }
-        if (file.captured.hash === null) continue
+        if (file.captured.hash === null) return
         baseline[file.relativePath] = { hash: file.captured.hash, mode: file.captured.mode, bytes: file.captured.size }
-      }
+      })
       open.baseline = baseline
       open.baselineComplete = complete
     }
@@ -360,20 +360,16 @@ export class RewindEngine {
     }
     const workspace = await canonicalDir(input.workspace)
     return this.exclusive(workspace, async () => {
-      const preview = await this.preview({
-        sessionId: input.sessionId,
-        workspace,
-        turn: input.turn,
-        ...(input.userMessageSeq === undefined ? {} : { userMessageSeq: input.userMessageSeq }),
-      })
-      if (preview.fingerprint !== input.fingerprint) {
+      const turns = await this.turnsFor(input.sessionId, workspace, input.turn)
+      const target = turns.find(record => record.turn === input.turn)
+      if (target !== undefined && input.userMessageSeq !== undefined && target.userMessageSeq !== input.userMessageSeq) {
+        throw new RewindError('STALE', 'the turn no longer matches its opening user message')
+      }
+      const described = await this.describe(workspace, turns, config)
+      if (previewFingerprint(turns.some(record => record.shellGap), described) !== input.fingerprint) {
         throw new RewindError('STALE', 'the worktree changed after the preview; open rewind again')
       }
-      const selected = selectFiles(
-        previewAll(preview, await this.describe(workspace, await this.turnsFor(input.sessionId, workspace, input.turn), config)),
-        config.conflictPolicy,
-        new Set(input.includeConflicts ?? []),
-      )
+      const selected = selectFiles(described, config.conflictPolicy, new Set(input.includeConflicts ?? []))
       const steps: JournalStep[] = []
       const result: { restored: string[]; deleted: string[]; unchanged: string[]; skipped: string[] } = {
         restored: [], deleted: [], unchanged: [...selected.unchanged], skipped: [...selected.skipped],
@@ -382,8 +378,8 @@ export class RewindEngine {
         for (const file of selected.write) {
           const targetPath = await this.restoreTarget(workspace, file.path, config.allowOutsideWorkspace)
           const redo = await readCandidate(workspace, file.path, { ...config, allowOutsideWorkspace: true }).catch(() => undefined)
-          const redoBytes = redo !== undefined && 'captured' in redo ? redo.captured.bytes : null
-          const redoHash = redoBytes === null || redoBytes === undefined ? null : await this.ledger.putBlob(redoBytes)
+          const captured = redo !== undefined && 'captured' in redo ? redo.captured : undefined
+          const redoHash = captured?.bytes == null || captured.hash == null ? null : await this.ledger.putBlob(captured.bytes, captured.hash)
           const redoMode = redo !== undefined && 'captured' in redo ? redo.captured.mode : file.mode
           const step: JournalStep = {
             path: file.path,
@@ -400,8 +396,6 @@ export class RewindEngine {
             const bytes = await this.ledger.readBlob(file.before)
             await replaceRegularFile(targetPath, bytes, file.mode || 0o644)
           }
-          stepDone(steps, file.path)
-          await this.ledger.writeJournal(workspace, journalOf(input, workspace, steps))
           if (file.action === 'delete') result.deleted.push(file.path)
           else result.restored.push(file.path)
         }
@@ -455,7 +449,7 @@ export class RewindEngine {
 
   private async storeCaptured(captured: CapturedBytes | undefined): Promise<void> {
     if (captured?.bytes == null || captured.hash == null) return
-    const stored = await this.ledger.putBlob(captured.bytes)
+    const stored = await this.ledger.putBlob(captured.bytes, captured.hash)
     if (stored !== captured.hash) throw new RewindError('STATE_CORRUPT', 'captured bytes do not match their hash')
   }
 
@@ -488,10 +482,10 @@ export class RewindEngine {
         reduced.set(path, { file: baselineAttribution(entry), checkpoint: true })
       }
       if (target.baselineComplete && config.enabled && config.captureExternal) {
-        const live = await scanWorkspace(workspace, config)
+        const live = await listEligibleFiles(workspace, config)
         for (const file of live.files) {
           if (reduced.has(file.relativePath)) continue
-          reduced.set(file.relativePath, { file: createdAttribution(file.captured.mode), checkpoint: true })
+          reduced.set(file.relativePath, { file: createdAttribution(file.mode), checkpoint: true })
         }
       }
     }
@@ -707,13 +701,6 @@ function previewFingerprint(shellGap: boolean, files: readonly PreviewFile[]): s
   return createHash('sha256').update(`${shellGap ? '1' : '0'}\n${lines.join('\n')}`).digest('hex')
 }
 
-function previewAll(preview: RewindPreview, files: readonly PreviewFile[]): readonly PreviewFile[] {
-  if (preview.fingerprint !== previewFingerprint(preview.shellGap, files)) {
-    throw new RewindError('STALE', 'the preview changed while it was being checked')
-  }
-  return files
-}
-
 function selectFiles(
   files: readonly PreviewFile[],
   policy: ResolvedRewindConfig['conflictPolicy'],
@@ -746,14 +733,6 @@ function selectFiles(
 
 function journalOf(input: { readonly sessionId: string; readonly turn: number }, workspace: string, steps: readonly JournalStep[]): RestoreJournal {
   return { version: 1, sessionId: input.sessionId, workspace, turn: input.turn, startedAt: Date.now(), steps: steps.map(step => ({ ...step })) }
-}
-
-function stepDone(steps: JournalStep[], path: string): void {
-  const step = steps.find(candidate => candidate.path === path)
-  if (step !== undefined) {
-    const index = steps.indexOf(step)
-    steps[index] = { ...step, done: true }
-  }
 }
 
 function pendingKey(sessionId: string, callId: string): string {
