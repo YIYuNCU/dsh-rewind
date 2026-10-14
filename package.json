@@ -2,6 +2,7 @@
   "name": "dsh-rewind",
   "version": "0.1.0",
   "description": "Per-turn file rewind for DeepSeek Harness. Stores file-tool before-images outside the worktree and forks the conversation instead of truncating it.",
+  "icon": "./icon.svg",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -26,6 +27,7 @@
     "src",
     "scripts",
     "cordis.patch.yml",
+    "icon.svg",
     "README.md",
     "LICENSE"
   ],
