@@ -1,6 +1,6 @@
 # dsh-rewind
 
-[![GitHub](https://img.shields.io/badge/GitHub-YIYuNCU%2Fdsh-rewind-181717?logo=github)](https://github.com/YIYuNCU/dsh-rewind)
+[![GitHub](https://img.shields.io/badge/GitHub-YIYuNCU%2Fdsh--rewind-181717?logo=github)](https://github.com/YIYuNCU/dsh-rewind)
 
 **DeepSeek Harness 的按轮回退插件。** 把文件改回某一轮开始时的内容，并另开会话。原来的会话记录保持不变。
 
