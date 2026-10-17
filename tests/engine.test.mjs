@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -18,15 +18,17 @@ async function fixture(config = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-rewind-'))
   const workspace = join(root, 'work')
   const storageDir = join(root, 'state')
+  const locationFile = join(root, 'location.json')
   await writeFile(join(root, '.keep'), '')
   const { mkdir } = await import('node:fs/promises')
   await mkdir(workspace)
-  const engine = new RewindEngine({ storageDir, ...config })
+  const engine = new RewindEngine({ storageDir, locationFile, ...config })
   await engine.initialize()
   return {
     root,
     workspace,
     storageDir,
+    locationFile,
     engine,
     async cleanup() {
       await rm(root, { recursive: true, force: true })
@@ -317,7 +319,7 @@ test('an interrupted restore is rolled back on the next startup', async () => {
     const preview = await fx.engine.preview({ sessionId, workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
     await fx.engine.apply({ sessionId, workspace: fx.workspace, turn: 1, fingerprint: preview.fingerprint })
     assert.equal(await readFile(join(fx.workspace, 'a.txt'), 'utf8'), 'old')
-    const restarted = new RewindEngine({ storageDir: fx.storageDir })
+    const restarted = new RewindEngine({ storageDir: fx.storageDir, locationFile: fx.locationFile })
     const recovered = await restarted.initialize()
     assert.equal(recovered, 1)
     assert.equal(await readFile(join(fx.workspace, 'a.txt'), 'utf8'), 'new')
@@ -514,6 +516,93 @@ test('retainGlobal keeps the newest turns across sessions', () => {
   assert.deepEqual(counted.find(session => session.sessionId === 'b')?.turns.map(record => record.turn), [3])
   const sized = retainGlobal(sessions, { maxStoredTurns: 10, maxStorageBytes: 15 })
   assert.deepEqual(sized.flatMap(session => session.turns).map(record => record.turn), [3])
+})
+
+test('relocating storage keeps saved files restorable', async () => {
+  const fx = await fixture({ captureExternal: false })
+  try {
+    const sessionId = await openTurn(fx.engine, fx.workspace)
+    await changeFile(fx.engine, fx.workspace, sessionId, 'c1', 'a.txt', 'old', 'new', 'edit')
+    const dest = join(fx.root, 'moved')
+    const same = await fx.engine.relocateStorage(fx.storageDir)
+    assert.equal(same.moved, false)
+    assert.equal(same.storageDir, fx.storageDir)
+    const moved = await fx.engine.relocateStorage(dest)
+    assert.equal(moved.moved, true)
+    assert.equal(moved.storageDir, dest)
+    assert.equal(fx.engine.config.storageDir, dest)
+    await assert.rejects(readdir(fx.storageDir))
+    const preview = await fx.engine.preview({ sessionId, workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
+    assert.equal(preview.totalFiles, 1)
+    await fx.engine.apply({ sessionId, workspace: fx.workspace, turn: 1, fingerprint: preview.fingerprint })
+    assert.equal(await readFile(join(fx.workspace, 'a.txt'), 'utf8'), 'old')
+    await fx.engine.commit(fx.workspace)
+    const recorded = JSON.parse(await readFile(fx.locationFile, 'utf8'))
+    assert.equal(recorded.storageDir, dest)
+  } finally {
+    await fx.cleanup()
+  }
+})
+
+test('relocation refuses a relative path, a nested path, a workspace, and a non-empty directory', async () => {
+  const fx = await fixture({ captureExternal: false })
+  try {
+    await openTurn(fx.engine, fx.workspace)
+    await assert.rejects(() => fx.engine.relocateStorage('relative/rewind'), (error) => {
+      assert.ok(error instanceof RewindError)
+      assert.equal(error.code, 'INVALID_CONFIG')
+      return true
+    })
+    await assert.rejects(() => fx.engine.relocateStorage(join(fx.storageDir, 'nested')), (error) => {
+      assert.ok(error instanceof RewindError)
+      assert.equal(error.code, 'INVALID_CONFIG')
+      return true
+    })
+    await assert.rejects(() => fx.engine.relocateStorage(join(fx.workspace, 'state')), (error) => {
+      assert.ok(error instanceof RewindError)
+      assert.equal(error.code, 'UNSAFE_PATH')
+      return true
+    })
+    const occupied = join(fx.root, 'occupied')
+    await mkdir(occupied)
+    await writeFile(join(occupied, 'keep.txt'), 'stay')
+    await assert.rejects(() => fx.engine.relocateStorage(occupied), (error) => {
+      assert.ok(error instanceof RewindError)
+      assert.equal(error.code, 'INVALID_CONFIG')
+      return true
+    })
+    assert.equal(await readFile(join(occupied, 'keep.txt'), 'utf8'), 'stay')
+    assert.equal(fx.engine.config.storageDir, fx.storageDir)
+    assert.throws(() => { fx.engine.updateConfig({ storageDir: join(fx.root, 'other') }) }, /cannot change/)
+    const empty = join(fx.root, 'empty-dest')
+    await mkdir(empty)
+    const moved = await fx.engine.relocateStorage(empty)
+    assert.equal(moved.moved, true)
+    assert.equal(moved.storageDir, empty)
+  } finally {
+    await fx.cleanup()
+  }
+})
+
+test('startup moves files when the saved directory is still empty', async () => {
+  const fx = await fixture({ captureExternal: false })
+  try {
+    const locationFile = join(fx.root, 'heal-location.json')
+    const oldDir = join(fx.root, 'old-state')
+    const dest = join(fx.root, 'new-state')
+    const first = new RewindEngine({ storageDir: oldDir, locationFile, captureExternal: false })
+    await first.initialize()
+    const sessionId = await openTurn(first, fx.workspace)
+    await changeFile(first, fx.workspace, sessionId, 'c1', 'a.txt', 'old', 'new', 'edit')
+    const second = new RewindEngine({ storageDir: dest, locationFile, captureExternal: false })
+    await second.initialize()
+    assert.equal(second.config.storageDir, dest)
+    const preview = await second.preview({ sessionId, workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
+    assert.equal(preview.totalFiles, 1)
+    await assert.rejects(readdir(oldDir))
+  } finally {
+    await fx.cleanup()
+  }
 })
 
 test('a global turn cap drops the older session', async () => {

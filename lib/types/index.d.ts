@@ -20,7 +20,7 @@ export declare class RewindService {
     readonly engine: RewindEngine;
     /**
      * @param ctx - Host context.
-     * @param config - Composition config. `storageDir` is fixed after this returns.
+     * @param config - Composition config. A later `storageDir` change moves existing files.
      */
     constructor(ctx: Context, config?: RewindConfig);
 }

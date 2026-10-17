@@ -34,6 +34,8 @@ export declare class Ledger {
     constructor(config: ResolvedRewindConfig);
     /** Use the latest retention settings without moving the storage root. */
     replaceConfig(config: ResolvedRewindConfig): void;
+    /** Point the ledger at a new root and drop caches that name the old one. */
+    rebind(config: ResolvedRewindConfig): void;
     /** Create the state root. */
     initialize(): Promise<void>;
     /**

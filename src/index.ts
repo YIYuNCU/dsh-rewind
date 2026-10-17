@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import { RewindEngine } from './engine.js'
 import { installCapture, installRewindHttp } from './host.js'
-import { RewindSettingsSchema, installRewindSettings } from './settings.js'
+import { RewindSettingsSchema, applyRewindSettings, installRewindSettings } from './settings.js'
 import type { RewindConfig } from './types.js'
 
 export { RewindEngine } from './engine.js'
@@ -41,7 +41,7 @@ export class RewindService {
 
   /**
    * @param ctx - Host context.
-   * @param config - Composition config. `storageDir` is fixed after this returns.
+   * @param config - Composition config. A later `storageDir` change moves existing files.
    */
   constructor(ctx: Context, config: RewindConfig = {}) {
     const normalized = unwrapVolatileConfig(config)
@@ -52,8 +52,12 @@ export class RewindService {
     ctx.inject(['webServer', 'sessions', 'sessionQuery', 'agents'], (scope: Context) => {
       installRewindHttp(scope, this.engine)
     })
+    const starting = this.engine.initialize()
     installRewindSettings(ctx, normalized, this.engine)
-    void this.engine.initialize().then(recovered => {
+    ctx.on('loader/volatile-update', () => {
+      applyRewindSettings(ctx, this.engine, unwrapVolatileConfig(config))
+    })
+    void starting.then(recovered => {
       if (recovered > 0) ctx.logger.warn(`[dsh-rewind] rolled back ${String(recovered)} interrupted restore(s)`)
       else ctx.logger.info(`[dsh-rewind] ready; state=${this.engine.config.storageDir}`)
     }).catch((error: unknown) => {

@@ -1,6 +1,6 @@
 /**
  * Runtime settings for DSH Rewind.
- * `storageDir` is cordis.yml only and is not hot-swappable.
+ * Changing `storageDir` moves existing files to the new directory.
  * @module dsh-rewind
  */
 import type { Context } from '@deepseek-ai/cordis';
@@ -37,15 +37,22 @@ export interface RewindSettings {
     maxPreviewFiles: number;
     staleLockMs: number;
     originCheck: 'same-origin' | 'off';
-    /** Empty uses the default state root. Changing it takes effect on the next launch. */
+    /** Empty uses the default state root. A new path moves existing files. */
     storageDir: string;
 }
 /** Schema projected into DSH 0.1.7 Config and the legacy settings namespace. */
 export declare const RewindSettingsSchema: Schema<RewindSettings>;
 /**
+ * Apply one settings snapshot. A different storage directory moves existing files.
+ * @param ctx - Host context. Failures are logged, not thrown.
+ * @param engine - Ledger to update.
+ * @param next - Settings to apply, including the raw storage directory.
+ */
+export declare function applyRewindSettings(ctx: Context, engine: RewindEngine, next: RewindConfig): void;
+/**
  * Register the settings namespace and push changes into the running engine.
  * @param ctx - Host context.
- * @param config - Composition config, including the fixed storage root.
+ * @param config - Composition config, including the storage root.
  * @param engine - Ledger to update.
  */
 export declare function installRewindSettings(ctx: Context, config: RewindConfig, engine: RewindEngine): void;

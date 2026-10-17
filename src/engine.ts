@@ -5,7 +5,8 @@ import { canonicalDir, classifyTool, isGeneratedPath, listEligibleFiles, matches
 import { RewindError } from './errors.js'
 import { Ledger, retainTurns, type JournalStep, type RestoreJournal } from './ledger.js'
 import { isNodeError, isWithin, pruneEmptyParents, removeFile, replaceRegularFile, resolveContainedPath } from './paths.js'
-import { resolveConfig } from './config.js'
+import { resolveConfig, resolveStorageDir } from './config.js'
+import { directoryHasEntries, normalizeStorageRequest, readStorageLocation, resolveLocationFile, sameStoragePath, storageContains, transferStorage, writeStorageLocation } from './relocate.js'
 import type {
   BaselineEntry,
   CaptureGap,
@@ -60,45 +61,88 @@ export class RewindEngine {
   private readonly turnOpenings = new Map<string, Promise<void>>()
   /** Serializes before-image reads of one path. The caller may write only after this resolves. */
   private readonly pathChains = new Map<string, Promise<unknown>>()
+  /** Last settings, so a storage move keeps every other field. */
+  private base: RewindConfig
+  /** Stable file that records which directory holds the bytes. */
+  private readonly locationFile: string
+  /** Startup work. Storage moves wait for it. */
+  private boot?: Promise<number>
+  /** In-flight captures and restores. A move waits until this is zero. */
+  private storageUsers = 0
+  /** True until startup finishes, and again while files are moving. */
+  private storageMoving = true
+  private readonly storageIdle: Array<() => void> = []
+  private readonly storageMoveDone: Array<() => void> = []
+  private relocateChain: Promise<void> = Promise.resolve()
 
   /**
-   * @param config - Plugin config. The storage root is fixed after construction.
+   * @param config - Plugin config. Change the storage root with {@link RewindEngine.relocateStorage}.
    */
   constructor(config: RewindConfig = {}) {
+    this.base = { ...config }
+    this.locationFile = resolveLocationFile(config.locationFile)
     this.current = resolveConfig(config)
     this.ledger = new Ledger(this.current)
   }
 
-  /** Resolved config. Retention and capture fields update in place; the storage root does not. */
+  /** Resolved config. Retention and capture fields update in place. */
   get config(): ResolvedRewindConfig {
     return this.current
   }
 
   /**
-   * Replace runtime settings.
-   * @param config - Next config. A different `storageDir` is rejected.
+   * Replace runtime settings other than the storage root.
+   * @param config - Next config. A different `storageDir` is rejected; use {@link RewindEngine.relocateStorage}.
    */
   updateConfig(config: RewindConfig): void {
-    const resolved = resolveConfig({ ...config, storageDir: config.storageDir ?? this.current.storageDir })
-    if (resolved.storageDir !== this.current.storageDir) {
-      throw new RewindError('INVALID_CONFIG', 'storageDir cannot change while rewind is running')
+    if (config.storageDir !== undefined && config.storageDir.trim() !== '') {
+      const requested = resolveStorageDir(config.storageDir)
+      if (!sameStoragePath(requested, this.current.storageDir)) {
+        throw new RewindError('INVALID_CONFIG', 'storageDir cannot change while rewind is running')
+      }
     }
-    this.current = resolved
-    this.ledger.replaceConfig(resolved)
+    const resolved = resolveConfig(configWithStorage(config, this.current.storageDir))
+    const next = { ...resolved, storageDir: this.current.storageDir }
+    this.base = configWithStorage(configWithLocation(config, this.base.locationFile), this.base.storageDir)
+    this.current = next
+    this.ledger.replaceConfig(next)
+  }
+
+  /**
+   * Move existing rewind files to `storageDir` and use that directory.
+   * An empty string selects the default root. The current directory is a no-op.
+   * @param storageDir - Absolute path, `~` path, or empty for the default.
+   * @returns The resolved directory and whether a directory was moved.
+   */
+  relocateStorage(storageDir: string): Promise<{ storageDir: string; moved: boolean }> {
+    const run = this.relocateChain.then(() => this.relocateExclusive(storageDir))
+    this.relocateChain = run.then(() => undefined, () => undefined)
+    return run
   }
 
   /** Apply the global storage and turn caps to every session log. */
   enforceRetention(): Promise<void> {
-    return this.ledger.enforceGlobalLimits()
+    return this.useStorage(() => this.ledger.enforceGlobalLimits())
   }
 
-  /** Create storage and roll back a restore that crashed mid-write. */
-  async initialize(): Promise<number> {
-    await this.ledger.initialize()
-    const workspaces = await this.ledger.journalWorkspaces()
-    for (const workspace of workspaces) await this.rollbackJournal(workspace)
-    await this.ledger.enforceGlobalLimits()
-    return workspaces.length
+  /** Create storage, finish an interrupted move, and roll back a restore that crashed mid-write. */
+  initialize(): Promise<number> {
+    this.boot ??= this.initializeExclusive()
+    return this.boot
+  }
+
+  private async initializeExclusive(): Promise<number> {
+    try {
+      await this.finishPendingTransfer()
+      await this.ledger.initialize()
+      const workspaces = await this.ledger.journalWorkspaces()
+      for (const workspace of workspaces) await this.rollbackJournal(workspace)
+      await this.ledger.enforceGlobalLimits()
+      await writeStorageLocation(this.locationFile, this.current.storageDir)
+      return workspaces.length
+    } finally {
+      this.releaseMove()
+    }
   }
 
   /**
@@ -119,7 +163,16 @@ export class RewindEngine {
     })
   }
 
-  private async openTurn(input: {
+  private openTurn(input: {
+    readonly sessionId: string
+    readonly workspace: string
+    readonly turn: number
+    readonly turnStartSeq: number
+  }): Promise<void> {
+    return this.useStorage(() => this.openTurnBody(input))
+  }
+
+  private async openTurnBody(input: {
     readonly sessionId: string
     readonly workspace: string
     readonly turn: number
@@ -170,6 +223,10 @@ export class RewindEngine {
   async noteUserMessage(sessionId: string, turn: number, userMessageSeq: number): Promise<void> {
     const opening = this.turnOpenings.get(sessionId)
     if (opening !== undefined) await opening
+    return this.useStorage(() => this.noteUserMessageBody(sessionId, turn, userMessageSeq))
+  }
+
+  private async noteUserMessageBody(sessionId: string, turn: number, userMessageSeq: number): Promise<void> {
     const current = this.open.get(sessionId)
     if (current === undefined || current.turn !== turn || current.userMessageSeq !== undefined) return
     current.userMessageSeq = userMessageSeq
@@ -189,12 +246,24 @@ export class RewindEngine {
     readonly toolName: string
     readonly args: unknown
   }): Promise<void> {
+    const sessionId = this.attributionSession(input.sessionId, input.parentSessionId, input.subagent)
+    const opening = sessionId === undefined ? undefined : this.turnOpenings.get(sessionId)
+    if (opening !== undefined) await opening
+    return this.useStorage(() => this.captureBeforeBody(input))
+  }
+
+  private async captureBeforeBody(input: {
+    readonly sessionId: string
+    readonly parentSessionId?: string
+    readonly subagent: boolean
+    readonly callId: string
+    readonly toolName: string
+    readonly args: unknown
+  }): Promise<void> {
     const config = this.current
     if (!config.enabled) return
     const sessionId = this.attributionSession(input.sessionId, input.parentSessionId, input.subagent)
     if (sessionId === undefined) return
-    const opening = this.turnOpenings.get(sessionId)
-    if (opening !== undefined) await opening
     const open = this.open.get(sessionId)
     if (open === undefined) return
     if (overlapsStorage(open.workspace, config.storageDir)) {
@@ -257,10 +326,22 @@ export class RewindEngine {
     readonly toolName: string
     readonly ok: boolean
   }): Promise<void> {
-    const config = this.current
     const sessionId = this.attributionSession(input.sessionId, input.parentSessionId, input.subagent) ?? input.sessionId
     const opening = this.turnOpenings.get(sessionId)
     if (opening !== undefined) await opening
+    return this.useStorage(() => this.captureAfterBody(input))
+  }
+
+  private async captureAfterBody(input: {
+    readonly sessionId: string
+    readonly parentSessionId?: string
+    readonly subagent: boolean
+    readonly callId: string
+    readonly toolName: string
+    readonly ok: boolean
+  }): Promise<void> {
+    const config = this.current
+    const sessionId = this.attributionSession(input.sessionId, input.parentSessionId, input.subagent) ?? input.sessionId
     const open = this.open.get(sessionId)
     const classified = classifyTool(input.toolName, {}, { ...config, extraFileTools: [] })
     if (classified.kind === 'shell') {
@@ -311,7 +392,16 @@ export class RewindEngine {
    * @param input - Session, canonical workspace, and turn.
    * @returns A fingerprint of every path, plus the first preview page.
    */
-  async preview(input: {
+  preview(input: {
+    readonly sessionId: string
+    readonly workspace: string
+    readonly turn: number
+    readonly userMessageSeq?: number
+  }): Promise<RewindPreview> {
+    return this.useStorage(() => this.previewBody(input))
+  }
+
+  private async previewBody(input: {
     readonly sessionId: string
     readonly workspace: string
     readonly turn: number
@@ -345,7 +435,19 @@ export class RewindEngine {
    * @param input - Preview fingerprint and conflict selection.
    * @returns Paths written, deleted, already matching, or skipped.
    */
-  async apply(input: {
+  apply(input: {
+    readonly sessionId: string
+    readonly workspace: string
+    readonly turn: number
+    readonly userMessageSeq?: number
+    readonly fingerprint: string
+    readonly includeConflicts?: readonly string[]
+    readonly workspaceBusy?: boolean
+  }): Promise<FileRestoreResult> {
+    return this.useStorage(() => this.applyBody(input))
+  }
+
+  private async applyBody(input: {
     readonly sessionId: string
     readonly workspace: string
     readonly turn: number
@@ -408,18 +510,22 @@ export class RewindEngine {
   }
 
   /** Drop the journal after the caller has finished the conversation fork. */
-  async commit(workspace: string): Promise<void> {
-    await this.ledger.deleteJournal(await canonicalDir(workspace))
+  commit(workspace: string): Promise<void> {
+    return this.useStorage(async () => {
+      await this.ledger.deleteJournal(await canonicalDir(workspace))
+    })
   }
 
   /** Put a workspace back to the bytes from before an unfinished restore. */
-  async rollback(workspace: string): Promise<void> {
-    await this.rollbackJournal(await canonicalDir(workspace))
+  rollback(workspace: string): Promise<void> {
+    return this.useStorage(async () => {
+      await this.rollbackJournal(await canonicalDir(workspace))
+    })
   }
 
   /** Session disk use, newest activity first. */
   usage(): Promise<SessionUsage[]> {
-    return this.ledger.usage()
+    return this.useStorage(() => this.ledger.usage())
   }
 
   /**
@@ -428,7 +534,106 @@ export class RewindEngine {
    * @returns The number of session ledgers removed.
    */
   purge(sessionId?: string): Promise<number> {
-    return this.ledger.purge(sessionId)
+    return this.useStorage(() => this.ledger.purge(sessionId))
+  }
+
+  private async relocateExclusive(storageDir: string): Promise<{ storageDir: string; moved: boolean }> {
+    if (this.boot === undefined) throw new RewindError('BUSY', 'rewind is still starting')
+    await this.boot
+    const requested = normalizeStorageRequest(storageDir)
+    const nextDir = resolveStorageDir(requested)
+    if (sameStoragePath(nextDir, this.current.storageDir)) return { storageDir: this.current.storageDir, moved: false }
+    this.storageMoving = true
+    try {
+      while (this.storageUsers > 0) {
+        await new Promise<void>(resolve => { this.storageIdle.push(resolve) })
+      }
+      const moved = await this.transferTo(nextDir, requested ?? '')
+      return { storageDir: this.current.storageDir, moved }
+    } finally {
+      this.releaseMove()
+    }
+  }
+
+  /** Move files, then point the ledger at the new root. A failed location write moves the files back. */
+  private async transferTo(nextDir: string, raw: string): Promise<boolean> {
+    const previous = this.current.storageDir
+    const previousRaw = this.base.storageDir
+    if (storageContains(previous, this.locationFile) || storageContains(nextDir, this.locationFile)) {
+      throw new RewindError('INVALID_CONFIG', 'storageDir must not contain the storage location record')
+    }
+    if (storageContains(previous, nextDir) || storageContains(nextDir, previous)) {
+      throw new RewindError('INVALID_CONFIG', 'storageDir must not contain the current storage directory')
+    }
+    const workspaces = new Set<string>()
+    for (const open of this.open.values()) workspaces.add(open.workspace)
+    for (const row of await this.ledger.usage()) workspaces.add(row.workspace)
+    for (const workspace of workspaces) {
+      if (storageContains(workspace, nextDir) || storageContains(nextDir, workspace)) {
+        throw new RewindError('UNSAFE_PATH', 'storageDir must not overlap a workspace')
+      }
+    }
+    const moved = await transferStorage(previous, nextDir)
+    try {
+      const next = resolveConfig(configWithStorage(this.base, raw === '' ? undefined : raw))
+      this.base = configWithStorage(this.base, raw)
+      this.current = { ...next, storageDir: nextDir }
+      this.ledger.rebind(this.current)
+      await writeStorageLocation(this.locationFile, nextDir)
+    } catch (error) {
+      await transferStorage(nextDir, previous).catch(() => false)
+      const restored = resolveConfig(configWithStorage(this.base, previous))
+      this.base = configWithStorage(this.base, previousRaw)
+      this.current = { ...restored, storageDir: previous }
+      this.ledger.rebind(this.current)
+      throw error instanceof RewindError ? error : new RewindError('RELOCATE_FAILED', 'could not record the storage directory', { cause: error })
+    }
+    return moved
+  }
+
+  /** Finish a move whose saved directory is empty and whose recorded directory still has files. */
+  private async finishPendingTransfer(): Promise<void> {
+    const recorded = await readStorageLocation(this.locationFile)
+    if (recorded === undefined || sameStoragePath(recorded, this.current.storageDir)) return
+    if (storageContains(recorded, this.current.storageDir) || storageContains(this.current.storageDir, recorded)) return
+    if (storageContains(recorded, this.locationFile) || storageContains(this.current.storageDir, this.locationFile)) return
+    if (await directoryHasEntries(this.current.storageDir)) return
+    if (!await directoryHasEntries(recorded)) return
+    await transferStorage(recorded, this.current.storageDir)
+  }
+
+  private async useStorage<T>(task: () => Promise<T>): Promise<T> {
+    await this.enterStorage()
+    try {
+      return await task()
+    } finally {
+      this.leaveStorage()
+    }
+  }
+
+  private async enterStorage(): Promise<void> {
+    for (;;) {
+      if (!this.storageMoving) {
+        this.storageUsers += 1
+        return
+      }
+      await new Promise<void>(resolve => { this.storageMoveDone.push(resolve) })
+    }
+  }
+
+  private leaveStorage(): void {
+    this.storageUsers -= 1
+    if (this.storageUsers <= 0) {
+      this.storageUsers = 0
+      const pending = this.storageIdle.splice(0)
+      for (const resolve of pending) resolve()
+    }
+  }
+
+  private releaseMove(): void {
+    this.storageMoving = false
+    const pending = this.storageMoveDone.splice(0)
+    for (const resolve of pending) resolve()
   }
 
   private attributionSession(sessionId: string, parentSessionId: string | undefined, subagent: boolean): string | undefined {
@@ -737,6 +942,18 @@ function journalOf(input: { readonly sessionId: string; readonly turn: number },
 
 function pendingKey(sessionId: string, callId: string): string {
   return `${sessionId}\0${callId}`
+}
+
+function configWithStorage(config: RewindConfig, storageDir: string | undefined): RewindConfig {
+  const { storageDir: _storage, ...rest } = config
+  if (storageDir === undefined || storageDir === '') return rest
+  return { ...rest, storageDir }
+}
+
+function configWithLocation(config: RewindConfig, locationFile: string | undefined): RewindConfig {
+  const { locationFile: _location, ...rest } = config
+  if (locationFile === undefined || locationFile === '') return rest
+  return { ...rest, locationFile }
 }
 
 function overlapsStorage(workspace: string, storageDir: string): boolean {

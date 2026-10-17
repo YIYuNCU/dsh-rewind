@@ -14,8 +14,13 @@ export type RewindMode = 'both' | 'code' | 'messages';
 export type GapReason = 'too-large' | 'symlink' | 'hardlink' | 'unsupported' | 'outside' | 'shell' | 'capture-failed';
 /** Plugin config accepted from cordis.yml and the settings card. */
 export interface RewindConfig {
-    /** State root. Empty uses `$DSH_HOME/rewind/v1` or `~/.dsh/rewind/v1`. Not hot-swappable. */
+    /** State root. Empty uses `$DSH_HOME/rewind/v1` or `~/.dsh/rewind/v1`. Changing it moves existing files. */
     readonly storageDir?: string;
+    /**
+     * File that records the directory holding rewind data.
+     * Empty uses `$DSH_HOME/rewind/.dsh-rewind-location.json`.
+     */
+    readonly locationFile?: string;
     /** Master switch for new captures. Existing records stay restorable. */
     readonly enabled?: boolean;
     /** Attribute a subagent file-tool edit to the parent session's open turn. */

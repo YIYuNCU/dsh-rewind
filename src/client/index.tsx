@@ -175,7 +175,11 @@ const copy = {
       restoreCreatedFiles: ['删除本轮新建的文件', '关闭后，这一轮新建的文件会留在原地。'],
       blockWhileAgentsRun: ['运行中禁止改文件', '同一工作区还有代理在跑时，不允许回退代码。'],
       putPromptInComposer: ['把原话放回输入框', '回退对话后，把当时的用户消息放进新会话的输入框。'],
+      storageDir: ['保存地址', '回退记录存放的目录。留空使用默认目录。保存时把已有文件转移到新地址。新地址须为空或不存在，且不能位于工作区内。'],
     } as Record<string, readonly [string, string]>,
+    storageSave: '保存并转移',
+    storageMoving: '正在转移…',
+    storagePlaceholder: '默认目录',
   },
   en: {
     title: 'Rewind',
@@ -224,7 +228,11 @@ const copy = {
       restoreCreatedFiles: ['Delete files created this turn', 'When off, files created during the turn stay in place.'],
       blockWhileAgentsRun: ['Block while agents run', 'Refuse a file rewind while any agent is running in the workspace.'],
       putPromptInComposer: ['Return the prompt to the composer', 'After a conversation rewind, put that user message in the new draft.'],
+      storageDir: ['Save location', 'Directory for rewind records. Leave empty to use the default. Saving moves existing files. The new directory must be empty or absent, and must not sit inside a workspace.'],
     } as Record<string, readonly [string, string]>,
+    storageSave: 'Save and move',
+    storageMoving: 'Moving…',
+    storagePlaceholder: 'Default directory',
   },
 } as const
 
@@ -422,6 +430,8 @@ function RewindSettingsCard({ view, scope }: SettingsProps): ReactNode {
   )
   const [usage, setUsage] = useState<readonly UsageRow[]>([])
   const [storageDir, setStorageDir] = useState('')
+  const [draft, setDraft] = useState<string | undefined>(undefined)
+  const [moving, setMoving] = useState(false)
   const [error, setError] = useState<string | undefined>()
   const value = snapshot.value
   useEffect(() => {
@@ -448,6 +458,36 @@ function RewindSettingsCard({ view, scope }: SettingsProps): ReactNode {
   const write = (key: string, next: boolean | number | string): void => {
     void scope?.set(key, next).catch((caught: unknown) => { setError(messageOf(caught)) })
   }
+  const locationLabel = text.fields.storageDir ?? ['', '']
+  const locationDraft = draft ?? storageDir
+  const locationUnchanged = sameLocation(locationDraft, storageDir)
+  const saveLocation = (): void => {
+    if (scope === undefined || value === undefined || moving) return
+    const requested = locationDraft.trim()
+    const previous = value.storageDir
+    setMoving(true)
+    setError(undefined)
+    void (async () => {
+      try {
+        await scope.set('storageDir', requested)
+        try {
+          await requestJson('/dsh-rewind/manage', {
+            method: 'POST',
+            body: JSON.stringify({ action: 'relocate', storageDir: requested }),
+          })
+        } catch (moveError) {
+          await scope.set('storageDir', previous).catch(() => undefined)
+          throw moveError
+        }
+        setDraft(undefined)
+        refresh()
+      } catch (caught: unknown) {
+        setError(messageOf(caught))
+      } finally {
+        setMoving(false)
+      }
+    })()
+  }
   const groups: readonly SettingsGroup[] = ['capture', 'restore', 'storage']
   return (
     <div data-dsh-rewind="settings">
@@ -455,6 +495,31 @@ function RewindSettingsCard({ view, scope }: SettingsProps): ReactNode {
       {value === undefined ? <p>{text.settingsMissing}</p> : groups.map(group => (
         <section key={group} data-dsh-rewind="group">
           <h4>{text.groups[group]}</h4>
+          {group === 'storage' ? (
+            <div data-dsh-rewind="row">
+              <div data-dsh-rewind="copy">
+                <strong>{locationLabel[0]}</strong>
+                <span>{locationLabel[1]}</span>
+              </div>
+              <div data-dsh-rewind="location">
+                <input
+                  aria-label={locationLabel[0]}
+                  spellCheck={false}
+                  value={locationDraft}
+                  placeholder={text.storagePlaceholder}
+                  disabled={moving || snapshot.writable === false}
+                  onChange={(event) => { setDraft(event.target.value) }}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={moving || snapshot.writable === false || locationUnchanged || scope === undefined}
+                  onClick={saveLocation}
+                >{moving ? text.storageMoving : text.storageSave}</Button>
+              </div>
+            </div>
+          ) : null}
           {VISIBLE_FIELDS.filter(field => field.group === group).map(field => {
             const labels = text.fields[field.key]
             const current = value[field.key]
@@ -525,7 +590,6 @@ function RewindSettingsCard({ view, scope }: SettingsProps): ReactNode {
           <h4>{text.usage}</h4>
           <Button type="button" variant="outline" size="sm" onClick={() => { void purge(undefined).then(refresh).catch((caught: unknown) => { setError(messageOf(caught)) }) }}>{text.purgeAll}</Button>
         </div>
-        {storageDir !== '' ? <p data-dsh-rewind="path"><span>{text.storage}</span> <code>{storageDir}</code></p> : null}
         {usage.length === 0 ? <p data-dsh-rewind="empty">{text.none}</p> : (
           <ul>
             {usage.map(row => (
@@ -608,6 +672,11 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function sameLocation(left: string, right: string): boolean {
+  const strip = (value: string): string => value.trim().replace(/[\\/]+$/u, '').toLowerCase()
+  return strip(left) === strip(right)
+}
+
 function mountStyles(): () => void {
   if (document.querySelector('style[data-dsh-rewind-style]') !== null) return () => {}
   const tag = document.createElement('style')
@@ -624,7 +693,9 @@ function mountStyles(): () => void {
     '[data-dsh-rewind="copy"] { display: flex; flex-direction: column; gap: 2px; min-width: 0; }',
     '[data-dsh-rewind="copy"] strong { font-size: 13px; font-weight: 500; line-height: 20px; }',
     '[data-dsh-rewind="copy"] span, [data-dsh-rewind="empty"], [data-dsh-rewind="path"] { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }',
-    '[data-dsh-rewind="control"] select, [data-dsh-rewind="control"] input { height: 32px; min-width: 148px; padding: 0 10px; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 13px; }',
+    '[data-dsh-rewind="control"] select, [data-dsh-rewind="control"] input, [data-dsh-rewind="location"] input { height: 32px; min-width: 148px; padding: 0 10px; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 13px; }',
+    '[data-dsh-rewind="location"] { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }',
+    '[data-dsh-rewind="location"] input { width: min(320px, 100%); min-width: 220px; }',
     '[data-dsh-rewind="control"] textarea { width: 320px; min-height: 96px; padding: 6px 10px; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 12px; line-height: 18px; resize: vertical; }',
     '[data-dsh-rewind="row"]:has(textarea) { align-items: flex-start; }',
     '[data-dsh-rewind="control"] label { display: flex; align-items: center; gap: 8px; }',

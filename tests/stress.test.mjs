@@ -26,6 +26,7 @@ async function fixture(config = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-rewind-stress-'))
   const workspace = join(root, 'work')
   const storageDir = join(root, 'state')
+  const locationFile = join(root, 'location.json')
   await mkdir(workspace)
   const engine = new RewindEngine({
     storageDir,
@@ -36,12 +37,14 @@ async function fixture(config = {}) {
     maxSessionBytes: 512 * 1024 * 1024,
     captureExternal: false,
     ...config,
+    locationFile,
   })
   await engine.initialize()
   return {
     root,
     workspace,
     storageDir,
+    locationFile,
     engine,
     async cleanup() {
       await rm(root, { recursive: true, force: true })
@@ -119,7 +122,7 @@ test('sequential burst captures, previews past the page, and restores every file
     assert.equal(await readFile(join(fx.workspace, '笔记', '甲.txt'), 'utf8'), 'before-0')
     assert.equal(await readFile(join(fx.workspace, 'file-079.txt'), 'utf8'), 'before-79')
 
-    const reloaded = new RewindEngine({ storageDir: fx.storageDir, retentionDays: 0, maxPreviewFiles: 10, maxStoredTurns: 10_000 })
+    const reloaded = new RewindEngine({ storageDir: fx.storageDir, locationFile: fx.locationFile, retentionDays: 0, maxPreviewFiles: 10, maxStoredTurns: 10_000 })
     await reloaded.initialize()
     const again = await reloaded.preview({ sessionId, workspace: fx.workspace, turn: 1, userMessageSeq: 11 })
     assert.equal(again.totalFiles, count)

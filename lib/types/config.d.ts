@@ -35,7 +35,7 @@ export declare const REWIND_DEFAULTS: {
  * @returns A complete config.
  */
 export declare function resolveConfig(config?: RewindConfig): ResolvedRewindConfig;
-/** Settings-card fields. `storageDir` stays on the cordis config layer. */
+/** Settings-card fields. `storageDir` is applied by moving the storage directory. */
 export declare function tunableSettings(config: ResolvedRewindConfig): Omit<ResolvedRewindConfig, 'storageDir' | 'shellTools' | 'extraFileTools' | 'pathFields' | 'excludeGlobs' | 'generatedDirectories'> & {
     shellTools: string;
     extraFileTools: string;
@@ -43,4 +43,6 @@ export declare function tunableSettings(config: ResolvedRewindConfig): Omit<Reso
     excludeGlobs: string;
     generatedDirectories: string;
 };
+/** Resolve an empty value to the default rewind root and expand `~`. */
+export declare function resolveStorageDir(value: string | undefined): string;
 export type { ConflictPolicy, OriginCheck, PreviewTrust, ShellPolicy };

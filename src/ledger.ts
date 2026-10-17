@@ -52,6 +52,16 @@ export class Ledger {
     this.config = config
   }
 
+  /** Point the ledger at a new root and drop caches that name the old one. */
+  rebind(config: ResolvedRewindConfig): void {
+    this.config = config
+    this.turnCache.clear()
+    this.sessionsLoaded = false
+    this.knownSessions.clear()
+    this.blobShards.clear()
+    this.journalLengths.clear()
+  }
+
   /** Create the state root. */
   async initialize(): Promise<void> {
     await mkdir(this.sessionsDir(), { recursive: true, mode: 0o700 })

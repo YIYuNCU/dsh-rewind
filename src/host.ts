@@ -260,7 +260,12 @@ async function handleManage(
       return
     }
     const body = objectBody(await readBody(request))
-    if (body.action !== 'purge') throw new RewindError('INVALID_ARGUMENTS', 'action must be purge')
+    if (body.action === 'relocate') {
+      if (typeof body.storageDir !== 'string') throw new RewindError('INVALID_ARGUMENTS', 'storageDir must be a string')
+      json(response, 200, await engine.relocateStorage(body.storageDir))
+      return
+    }
+    if (body.action !== 'purge') throw new RewindError('INVALID_ARGUMENTS', 'action must be purge or relocate')
     const sessionId = typeof body.sessionId === 'string' && body.sessionId !== '' ? body.sessionId : undefined
     json(response, 200, { purged: await engine.purge(sessionId) })
   } catch (error) {

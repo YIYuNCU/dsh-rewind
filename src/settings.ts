@@ -1,6 +1,6 @@
 /**
  * Runtime settings for DSH Rewind.
- * `storageDir` is cordis.yml only and is not hot-swappable.
+ * Changing `storageDir` moves existing files to the new directory.
  * @module dsh-rewind
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -41,7 +41,7 @@ export interface RewindSettings {
   maxPreviewFiles: number
   staleLockMs: number
   originCheck: 'same-origin' | 'off'
-  /** Empty uses the default state root. Changing it takes effect on the next launch. */
+  /** Empty uses the default state root. A new path moves existing files. */
   storageDir: string
 }
 
@@ -79,7 +79,7 @@ export const RewindSettingsSchema: Schema<RewindSettings> = z.object({
   maxPreviewFiles: volatileWhenSupported(z.number().step(1).min(1).max(1_000).default(REWIND_DEFAULTS.maxPreviewFiles)),
   staleLockMs: volatileWhenSupported(z.number().step(1).min(1_000).default(REWIND_DEFAULTS.staleLockMs)),
   originCheck: volatileWhenSupported(z.union(['same-origin', 'off']).default(REWIND_DEFAULTS.originCheck)),
-  storageDir: z.string().default(''),
+  storageDir: volatileWhenSupported(z.string().default('')),
 })
 
 interface SettingsScopeLike<T> {
@@ -98,9 +98,27 @@ interface SettingsProviderLike {
 }
 
 /**
+ * Apply one settings snapshot. A different storage directory moves existing files.
+ * @param ctx - Host context. Failures are logged, not thrown.
+ * @param engine - Ledger to update.
+ * @param next - Settings to apply, including the raw storage directory.
+ */
+export function applyRewindSettings(ctx: Context, engine: RewindEngine, next: RewindConfig): void {
+  try {
+    engine.updateConfig({ ...next, storageDir: engine.config.storageDir })
+  } catch (error) {
+    ctx.logger.warn(`[dsh-rewind] could not apply settings: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const storageDir = typeof next.storageDir === 'string' ? next.storageDir : ''
+  void engine.relocateStorage(storageDir).then(() => engine.enforceRetention()).catch((error: unknown) => {
+    ctx.logger.warn(`[dsh-rewind] could not apply storage settings: ${error instanceof Error ? error.message : String(error)}`)
+  })
+}
+
+/**
  * Register the settings namespace and push changes into the running engine.
  * @param ctx - Host context.
- * @param config - Composition config, including the fixed storage root.
+ * @param config - Composition config, including the storage root.
  * @param engine - Ledger to update.
  */
 export function installRewindSettings(ctx: Context, config: RewindConfig, engine: RewindEngine): void {
@@ -108,16 +126,7 @@ export function installRewindSettings(ctx: Context, config: RewindConfig, engine
   let source: () => RewindSettings = () => entry
   const hooks: SettingsHooks<RewindSettings> = {
     setSource: (current) => { source = current },
-    onChange: () => {
-      try {
-        engine.updateConfig({ ...config, ...source(), storageDir: engine.config.storageDir })
-        void engine.enforceRetention().catch((retentionError: unknown) => {
-          ctx.logger.warn(`[dsh-rewind] could not apply storage limits: ${retentionError instanceof Error ? retentionError.message : String(retentionError)}`)
-        })
-      } catch (error) {
-        ctx.logger.warn(`[dsh-rewind] could not apply settings: ${error instanceof Error ? error.message : String(error)}`)
-      }
-    },
+    onChange: () => { applyRewindSettings(ctx, engine, { ...config, ...source() }) },
   }
   ctx.inject(['settings'], (scope: Context) => {
     const provider = scope.settings as SettingsProvider & SettingsProviderLike

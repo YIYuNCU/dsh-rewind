@@ -1,5 +1,5 @@
 /** Closed set of restore failures a caller can branch on. */
-export declare const REWIND_CODES: readonly ["INVALID_CONFIG", "INVALID_ARGUMENTS", "STATE_CORRUPT", "NOT_FOUND", "STALE", "BUSY", "UNSAFE_PATH", "RESTORE_FAILED", "FORK_FAILED", "ORIGIN_REJECTED"];
+export declare const REWIND_CODES: readonly ["INVALID_CONFIG", "INVALID_ARGUMENTS", "STATE_CORRUPT", "NOT_FOUND", "STALE", "BUSY", "UNSAFE_PATH", "RESTORE_FAILED", "RELOCATE_FAILED", "FORK_FAILED", "ORIGIN_REJECTED"];
 /** One {@link REWIND_CODES} value. */
 export type RewindCode = typeof REWIND_CODES[number];
 /** Stable failure from the rewind ledger or its host adapter. */

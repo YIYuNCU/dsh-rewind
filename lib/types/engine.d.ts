@@ -15,21 +15,45 @@ export declare class RewindEngine {
     private readonly turnOpenings;
     /** Serializes before-image reads of one path. The caller may write only after this resolves. */
     private readonly pathChains;
+    /** Last settings, so a storage move keeps every other field. */
+    private base;
+    /** Stable file that records which directory holds the bytes. */
+    private readonly locationFile;
+    /** Startup work. Storage moves wait for it. */
+    private boot?;
+    /** In-flight captures and restores. A move waits until this is zero. */
+    private storageUsers;
+    /** True until startup finishes, and again while files are moving. */
+    private storageMoving;
+    private readonly storageIdle;
+    private readonly storageMoveDone;
+    private relocateChain;
     /**
-     * @param config - Plugin config. The storage root is fixed after construction.
+     * @param config - Plugin config. Change the storage root with {@link RewindEngine.relocateStorage}.
      */
     constructor(config?: RewindConfig);
-    /** Resolved config. Retention and capture fields update in place; the storage root does not. */
+    /** Resolved config. Retention and capture fields update in place. */
     get config(): ResolvedRewindConfig;
     /**
-     * Replace runtime settings.
-     * @param config - Next config. A different `storageDir` is rejected.
+     * Replace runtime settings other than the storage root.
+     * @param config - Next config. A different `storageDir` is rejected; use {@link RewindEngine.relocateStorage}.
      */
     updateConfig(config: RewindConfig): void;
+    /**
+     * Move existing rewind files to `storageDir` and use that directory.
+     * An empty string selects the default root. The current directory is a no-op.
+     * @param storageDir - Absolute path, `~` path, or empty for the default.
+     * @returns The resolved directory and whether a directory was moved.
+     */
+    relocateStorage(storageDir: string): Promise<{
+        storageDir: string;
+        moved: boolean;
+    }>;
     /** Apply the global storage and turn caps to every session log. */
     enforceRetention(): Promise<void>;
-    /** Create storage and roll back a restore that crashed mid-write. */
+    /** Create storage, finish an interrupted move, and roll back a restore that crashed mid-write. */
     initialize(): Promise<number>;
+    private initializeExclusive;
     /**
      * Remember the workspace turn that is about to run.
      * @param input - Identity of the turn.
@@ -41,6 +65,7 @@ export declare class RewindEngine {
         readonly turnStartSeq: number;
     }): Promise<void>;
     private openTurn;
+    private openTurnBody;
     /**
      * Attach the opening user message to the current turn.
      * @param sessionId - Session that owns the message.
@@ -48,6 +73,7 @@ export declare class RewindEngine {
      * @param userMessageSeq - Event sequence of the direct user message.
      */
     noteUserMessage(sessionId: string, turn: number, userMessageSeq: number): Promise<void>;
+    private noteUserMessageBody;
     /**
      * Record a before-image when a file tool is about to run.
      * Failures become gaps. They do not fail the tool.
@@ -61,6 +87,7 @@ export declare class RewindEngine {
         readonly toolName: string;
         readonly args: unknown;
     }): Promise<void>;
+    private captureBeforeBody;
     /**
      * Commit or drop the before-image after the tool result.
      * @param input - Call identity and whether the tool succeeded.
@@ -73,6 +100,7 @@ export declare class RewindEngine {
         readonly toolName: string;
         readonly ok: boolean;
     }): Promise<void>;
+    private captureAfterBody;
     /**
      * Compare the attributed paths at and after `turn` with the worktree.
      * @param input - Session, canonical workspace, and turn.
@@ -84,6 +112,7 @@ export declare class RewindEngine {
         readonly turn: number;
         readonly userMessageSeq?: number;
     }): Promise<RewindPreview>;
+    private previewBody;
     /**
      * Write attributed paths back to their before-images.
      * The journal stays until {@link RewindEngine.commit} or {@link RewindEngine.rollback}.
@@ -99,6 +128,7 @@ export declare class RewindEngine {
         readonly includeConflicts?: readonly string[];
         readonly workspaceBusy?: boolean;
     }): Promise<FileRestoreResult>;
+    private applyBody;
     /** Drop the journal after the caller has finished the conversation fork. */
     commit(workspace: string): Promise<void>;
     /** Put a workspace back to the bytes from before an unfinished restore. */
@@ -111,6 +141,15 @@ export declare class RewindEngine {
      * @returns The number of session ledgers removed.
      */
     purge(sessionId?: string): Promise<number>;
+    private relocateExclusive;
+    /** Move files, then point the ledger at the new root. A failed location write moves the files back. */
+    private transferTo;
+    /** Finish a move whose saved directory is empty and whose recorded directory still has files. */
+    private finishPendingTransfer;
+    private useStorage;
+    private enterStorage;
+    private leaveStorage;
+    private releaseMove;
     private attributionSession;
     private turnsFor;
     private addGap;

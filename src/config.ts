@@ -102,7 +102,7 @@ export function resolveConfig(config: RewindConfig = {}): ResolvedRewindConfig {
   }
 }
 
-/** Settings-card fields. `storageDir` stays on the cordis config layer. */
+/** Settings-card fields. `storageDir` is applied by moving the storage directory. */
 export function tunableSettings(config: ResolvedRewindConfig): Omit<ResolvedRewindConfig, 'storageDir' | 'shellTools' | 'extraFileTools' | 'pathFields' | 'excludeGlobs' | 'generatedDirectories'> & {
   shellTools: string
   extraFileTools: string
@@ -140,7 +140,8 @@ export function tunableSettings(config: ResolvedRewindConfig): Omit<ResolvedRewi
   }
 }
 
-function resolveStorageDir(value: string | undefined): string {
+/** Resolve an empty value to the default rewind root and expand `~`. */
+export function resolveStorageDir(value: string | undefined): string {
   if (value !== undefined && value.trim() !== '') return resolve(expandHome(value.trim()))
   const home = process.env.DSH_HOME
   const root = home !== undefined && home.trim() !== '' ? resolve(expandHome(home.trim())) : join(homedir(), '.dsh')
