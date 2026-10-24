@@ -1,6 +1,6 @@
 {
   "name": "dsh-rewind",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Per-turn file rewind for DeepSeek Harness. Stores file-tool before-images outside the worktree and forks the conversation instead of truncating it.",
   "icon": "./icon.svg",
   "type": "module",
@@ -45,7 +45,7 @@
       ]
     },
     "compatibility": {
-      "dsh": ">=0.1.0-rc.8 <0.2.0 || ^0.1.7-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.2",
+      "dsh": ">=0.1.0-rc.8 <0.2.0 || ^0.2.0-rc.2",
       "profiles": ["web"]
     }
   },
@@ -59,7 +59,7 @@
   "license": "BSD-3-Clause",
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.8 <0.2.0 || ^0.1.5-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.8 <0.2.0 || ^0.2.0-rc.2",
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "peerDependenciesMeta": {
@@ -74,6 +74,7 @@
     "typescript": "^5.9.2"
   },
   "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.1.0-rc.8 <0.2.0 || ^0.2.0-rc.2"
   }
 }

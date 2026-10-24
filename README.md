@@ -81,8 +81,11 @@ dsh plugin --profile web add ./dsh-rewind
 `package.json` 声明的 DeepSeek Harness 版本：
 
 ```text
->=0.1.0-rc.8 <0.2.0 || ^0.1.7-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.2
+>=0.1.0-rc.8 <0.2.0 || ^0.2.0-rc.2
 ```
+
+`engines.dsh` 与 `@deepseek-ai/dsh-settings` peer 声明同一个范围：0.2 系列从 `0.2.0-rc.2` 起，
+覆盖后续所有 `0.2.x`（含 `0.2.1-rc.3`）；`^0.2.0-rc.2` 不含 `0.3.0`，新的大版本需要重新声明。
 
 Node.js：`^22.19.0 || >=24`。
 
